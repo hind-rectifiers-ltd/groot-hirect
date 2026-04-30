@@ -1,0 +1,13 @@
+# Core dependencies for RobStride motor control
+python-can>=4.0.0
+numpy>=1.21.0
+
+# Optional dependencies for enhanced functionality
+tqdm>=4.62.0          # Progress bars
+matplotlib>=3.5.0     # Plotting and visualization (optional)
+
+# Development dependencies (install with: pip install -r requirements-dev.txt)
+# pytest>=6.0.0       # Testing framework
+# black>=21.0.0       # Code formatter
+# flake8>=3.9.0       # Linter
+# mypy>=0.910         # Type checking
