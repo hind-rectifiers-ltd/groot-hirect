@@ -1,181 +1,177 @@
-# Recording Toolkit for Custom 3-Camera Humanoid
+# Recording + Fine-tune + Real-Hardware Validation (3-Cam, 12-DoF)
 
-This folder provides a minimal workflow to collect data for GR00T VLA in the schema we discussed:
+This folder contains the exact workflow used for a custom 3-camera humanoid setup:
 
 - Cameras: `cam_head`, `cam_left_wrist`, `cam_right_wrist`
-- State/action dims: `12` (left arm 5 + left gripper 1 + right arm 5 + right gripper 1)
-- Recording format: per-episode HDF5 (`episode_XXXXXX.hdf5`)
-- Conversion output: GR00T-flavored LeRobot v2 dataset with `meta/modality.json`
+- Joint layout: `12` DoF (`left_arm[5] + left_gripper[1] + right_arm[5] + right_gripper[1]`)
+- Raw capture format: `episode_XXXXXX.hdf5`
+- Training format: GR00T-compatible LeRobot v2.1
+- Embodiment tag: `NEW_EMBODIMENT` (registered by `record/custom_3cam_config.py`)
 
-## Files
+Use this as an actionable runbook from data collection to real robot rollout.
 
-- `record_episodes_3cam.py`: records raw HDF5 episodes.
-- `convert_3cam_to_groot_lerobot.py`: converts HDF5 episodes to LeRobot v2 and writes `meta/modality.json`.
-- `visualize_recorded_episodes.py`: local multi-camera viewer (similar idea to the [LeRobot visualizer](https://huggingface.co/spaces/lerobot/visualize_dataset) on Hugging Face).
+## Tools in this folder
 
-## Visualize recorded data (local)
+- `record/record_episodes_3cam.py`: records raw HDF5 episodes.
+- `record/visualize_recorded_episodes.py`: validates multi-camera episodes and joint traces.
+- `record/convert_3cam_to_groot_lerobot.py`: converts raw episodes to LeRobot (v3 layout first).
+- `record/custom_3cam_config.py`: registers modality config for `NEW_EMBODIMENT`.
+- `record/policy_client_3cam.py`: client for GR00T server (USB cam / demo / RobStride backends).
 
-Plays back `episode_*.hdf5` with **head | left wrist | right wrist** in one horizontal strip, task text overlay, and **time-series plots** of full-episode **qpos** and **action** (all joints) with a **yellow frame cursor**, plus keyboard controls (like scrubbing a LeRobot-style dataset).
+---
 
-**One session folder** (matches `--session` from recording):
+## 0) One-time setup and naming
 
-```bash
-uv run python record/visualize_recorded_episodes.py --data-dir ./record/cube_pick_place
-```
+Use a consistent task sentence end-to-end (recording, training, inference).  
+For this project, the task text used in demos is:
 
-**All episodes under `./record` recursively** (every session):
+`pick up the object and place it in the tray`
 
-```bash
-uv run python record/visualize_recorded_episodes.py --data-dir ./record --recursive
-```
-
-**Export a preview video** (no GUI):
+Set convenient variables from repo root:
 
 ```bash
-uv run python record/visualize_recorded_episodes.py \
-  --data-dir ./record/cube_pick_place \
-  --episode 0 \
-  --save-video /tmp/preview_cube.mp4
+export RAW_DIR=./record/pickplace
+export REPO_ID=my_robot/pickplace_3cam
+export LEROBOT_ROOT=/home/yash/.cache/huggingface/lerobot
+export DS=${LEROBOT_ROOT}/${REPO_ID}
+export FT_OUT=./outputs/gr00t_custom_3cam
 ```
 
-**OpenCV vs headless:** the repo often uses `opencv-python-headless`, which has no `imshow`. The visualizer **auto-switches to a Matplotlib window** in that case. To force OpenCV windows, install `uv pip install opencv-python`, or pass `--gui matplotlib` / `--gui opencv` explicitly. Use `--save-video` for a file-only export with no display.
+---
 
-## 1) Record demos
+## 1) Record episodes (v2 flow input)
 
-Example (USB cameras only, zero state/action placeholders):
+Check camera IDs first:
 
 ```bash
 uv run python record/record_episodes_3cam.py \
-  --output-dir ./record/raw \
-  --robot usb_cam \
-  --video-cam-head 12 \
-  --video-cam-left-wrist 5 \
-  --video-cam-right-wrist 1 \
-  --task "pick up the object and place it in the tray"
+  --output-dir "${RAW_DIR}" \
+  --test-cameras \
+  --test-cameras-max 16
 ```
 
-If you already have robot state/action from your own stack, plug your backend into `RobotInterface` in the script.
-
-Example (direct teleop + RobStride follower + 3 cameras):
+Record with direct teleop + RobStride follower + 3 cameras:
 
 ```bash
 uv run python record/record_episodes_3cam.py \
-  --output-dir ./record/pickplace \
+  --output-dir "${RAW_DIR}" \
   --robot direct_teleop \
   --leader-port /dev/ttyACM0 \
   --leader-baud 57600 \
   --teleop-rate 10 \
   --video-cam-head 12 \
-  --video-cam-left-wrist 5 \
+  --video-cam-left-wrist 2 \
   --video-cam-right-wrist 1 \
   --task "pick up the object and place it in the tray"
 ```
 
-Find working camera indices first:
+Notes:
+
+- Recording starts after the countdown and `Start teleoperating now.` message.
+- `Ctrl+C` ends current episode and saves what is captured.
+- Re-running the same command auto-increments `episode_XXXXXX.hdf5`.
+
+---
+
+## 2) Visualize recorded episodes before conversion
+
+Inspect one session:
 
 ```bash
-uv run python record/record_episodes_3cam.py \
-  --output-dir ./record/raw \
-  --test-cameras \
-  --test-cameras-max 16
+uv run python record/visualize_recorded_episodes.py --data-dir "${RAW_DIR}"
 ```
 
-### During recording
+Inspect recursively under `record/`:
 
-After a 2-second countdown, the script prints `**Start teleoperating now.**` — that is when recording has begun.
+```bash
+uv run python record/visualize_recorded_episodes.py --data-dir ./record --recursive
+```
 
-**End an episode early:** press **Ctrl+C**. Whatever frames were captured are saved as a **partial** episode (useful if you finish the task before `--max-steps`).
+Export one preview clip:
 
-**Next episode:** run the **same command again** in the same shell (or use the Up arrow to recall it). The script auto-picks the next index (`episode_000000.hdf5`, `episode_000001.hdf5`, …). The final log line tells you the next filename.
+```bash
+uv run python record/visualize_recorded_episodes.py \
+  --data-dir "${RAW_DIR}" \
+  --episode 0 \
+  --save-video /tmp/preview_pickplace.mp4
+```
 
-**Override index (optional):** pass `--episode-idx N` if you need a specific number.
+Checklist before conversion:
 
-## 2) Convert to GR00T LeRobot v2
+- Camera streams are synchronized and not swapped.
+- Task text overlay is correct.
+- `qpos` and `action` traces look smooth and physically plausible.
+
+---
+
+## 3) Convert to LeRobot and then to GR00T-compatible v2.1
+
+### 3.1 Raw HDF5 -> LeRobot (current converter writes v3 layout first)
 
 ```bash
 uv run python record/convert_3cam_to_groot_lerobot.py \
-  --raw-dir ./record/raw \
-  --repo-id my_robot/pickplace_3cam \
+  --raw-dir "${RAW_DIR}" \
+  --repo-id "${REPO_ID}" \
   --fps 30 \
   --state-dim 12 \
   --action-dim 12
 ```
 
-This writes output under `${HF_LEROBOT_HOME}/my_robot/pickplace_3cam` (default under Hugging Face cache, typically `~/.cache/huggingface/lerobot`). **Current `lerobot` creates LeRobot v3.0 layout** (chunked `data/` parquet, `meta/episodes/` parquet, `meta/tasks.parquet`, …).
-
-GR00T’s data loader expects **LeRobot v2.1-style files** (`meta/episodes.jsonl`, `meta/tasks.jsonl`, **one parquet file per episode**). After conversion, run the repo’s **v3 → v2.1** script once, then restore `meta/modality.json`.
-
-### 2.1) Convert dataset to GR00T-compatible LeRobot v2.1
-
-From the Isaac-GR00T repo root:
+### 3.2 LeRobot v3 -> v2.1 (required for GR00T loader)
 
 ```bash
 uv run python scripts/lerobot_conversion/convert_v3_to_v2.py \
-  --repo-id my_robot/pickplace_3cam \
-  --root /home/yash/.cache/huggingface/lerobot
+  --repo-id "${REPO_ID}" \
+  --root "${LEROBOT_ROOT}"
 ```
 
-- `--root` is the **parent directory** of your dataset (usually `$HF_LEROBOT_HOME` / `~/.cache/huggingface/lerobot`).
-- The script backs up the v3.0 tree to `pickplace_3cam_v3.0/` (same parent directory as the dataset) and replaces the dataset folder with a v2.1 layout.
-
-The conversion **does not copy** `meta/modality.json`. Restore it from the backup:
+Restore modality metadata from backup (`*_v3.0`) because v3->v2 conversion does not carry it:
 
 ```bash
-DS=/home/yash/.cache/huggingface/lerobot/my_robot/pickplace_3cam
-# Backup folder name is `<dataset_stem>_v3.0`, not `*_v30` (see convert_v3_to_v2.py).
 cp "${DS}_v3.0/meta/modality.json" "${DS}/meta/modality.json"
 ```
 
-Optional (only if you generated `relative_stats.json` before converting):
+Optional (if present):
 
 ```bash
 test -f "${DS}_v3.0/meta/relative_stats.json" && cp "${DS}_v3.0/meta/relative_stats.json" "${DS}/meta/"
 ```
 
-Then run **§4 stats** on `"${DS}"` if `meta/stats.json` is missing (the v3→v2 script copies `stats.json` when present).
-
-## 3) Modality config for `NEW_EMBODIMENT` (required)
-
-`NEW_EMBODIMENT` is not built into `MODALITY_CONFIGS` until a Python config **registers** it via `register_modality_config()`.
-
-This repo ships **`record/custom_3cam_config.py`**, which matches the `meta/modality.json` produced by the converter (3 cams, 12-DoF split into four groups, 16-step action horizon, absolute joint actions as a simple baseline). **Import that file** before any tool that needs the tag (stats, finetune, server) by passing:
-
-`--modality-config-path record/custom_3cam_config.py`
-
-To customize (e.g. relative arm deltas, different horizon), copy the file and edit; then point `--modality-config-path` at your copy.
+---
 
 ## 4) Generate dataset statistics (required)
 
-After conversion, run (note **`--modality-config-path`** — without it, `new_embodiment` is not registered and stats will fail):
+`NEW_EMBODIMENT` is custom and must be registered by loading `record/custom_3cam_config.py`.
 
 ```bash
 uv run python gr00t/data/stats.py \
-  --dataset-path <converted_dataset_path> \
+  --dataset-path "${DS}" \
   --embodiment-tag NEW_EMBODIMENT \
   --modality-config-path record/custom_3cam_config.py
 ```
 
-This generates:
+Expected files:
 
-- `meta/stats.json`
-- `meta/relative_stats.json` (only for action subspaces marked `RELATIVE` in the modality config; with the shipped file, relative stats are typically empty)
+- `${DS}/meta/stats.json`
+- `${DS}/meta/relative_stats.json` (may be mostly empty with absolute-action config)
 
-If you change action horizon or modality keys in the config, rerun this command.
+Rerun this whenever modality/action definitions change.
 
-## 5) Fine-tune GR00T
+---
 
-Single-GPU example:
+## 5) Fine-tune GR00T N1.7
+
+Single-GPU command used in this setup:
 
 ```bash
 export NUM_GPUS=1
-CUDA_VISIBLE_DEVICES=0 uv run python \
-  gr00t/experiment/launch_finetune.py \
+CUDA_VISIBLE_DEVICES=0 uv run python gr00t/experiment/launch_finetune.py \
   --base-model-path nvidia/GR00T-N1.7-3B \
-  --dataset-path <converted_dataset_path> \
+  --dataset-path "${DS}" \
   --embodiment-tag NEW_EMBODIMENT \
   --modality-config-path record/custom_3cam_config.py \
-  --num-gpus $NUM_GPUS \
-  --output-dir /tmp/gr00t_custom_3cam \
+  --num-gpus "${NUM_GPUS}" \
+  --output-dir "${FT_OUT}" \
   --max-steps 10000 \
   --save-steps 2000 \
   --save-total-limit 5 \
@@ -183,65 +179,106 @@ CUDA_VISIBLE_DEVICES=0 uv run python \
   --dataloader-num-workers 4
 ```
 
-## 6) Open-loop evaluation (sanity check)
+Checkpoint example:
 
-Run evaluation on a few trajectories before real-robot deployment:
+- `./outputs/gr00t_custom_3cam/checkpoint-10000`
+
+Use `./outputs` (inside repo) instead of `/tmp` so checkpoints are persistent.
+
+---
+
+## 6) Open-loop sanity evaluation (recommended)
 
 ```bash
 uv run python gr00t/eval/open_loop_eval.py \
-  --dataset-path <converted_dataset_path> \
+  --dataset-path "${DS}" \
   --embodiment-tag NEW_EMBODIMENT \
-  --model-path /tmp/gr00t_custom_3cam/checkpoint-10000 \
+  --model-path ./outputs/gr00t_custom_3cam/checkpoint-10000 \
   --traj-ids 0 1 2 \
   --action-horizon 16 \
   --steps 300
 ```
 
-If predictions diverge heavily from GT, improve data quality/coverage before deployment.
+If predictions diverge strongly from GT, improve data quality/coverage before hardware rollout.
 
-## 7) Deploy on edge (TensorRT path)
+---
 
-### 7.1 Export ONNX from checkpoint
+## 7) Run inference server with fine-tuned checkpoint
+
+```bash
+uv run python gr00t/eval/run_gr00t_server.py \
+  --model-path ./outputs/gr00t_custom_3cam/checkpoint-10000 \
+  --embodiment-tag NEW_EMBODIMENT \
+  --modality-config-path record/custom_3cam_config.py \
+  --device cuda \
+  --host 0.0.0.0 \
+  --port 5555
+```
+
+---
+
+## 8) Validate on real hardware (`policy_client_3cam.py`)
+
+Run RobStride client against server:
+
+```bash
+uv run python record/policy_client_3cam.py \
+  --host localhost \
+  --port 5555 \
+  --task "pick up the object and place it in the tray" \
+  --robot robstride \
+  --video-cam-head 12 \
+  --video-cam-left-wrist 2 \
+  --video-cam-right-wrist 1 \
+  --apply-actions
+```
+
+Useful tuning flags:
+
+- `--policy-ramp-max-speed 1.5` to make initial motion gentler.
+- `--ramp-from-feedback` only if needed (can introduce oscillation in some setups).
+- `--negate-a12-indices 1` to test a sign flip for the second left-arm joint (motor 3) if motion direction is inverted.
+
+Real-robot validation checklist:
+
+- Start with small-speed ramp and clear workspace.
+- Confirm `qpos` is stable (no frequent all-zero reads).
+- Verify first motion direction and joint limits before full task rollout.
+- Keep task text exactly aligned with training text.
+
+---
+
+## 9) Optional edge deployment path (ONNX/TensorRT)
+
+Export ONNX:
 
 ```bash
 uv run python scripts/deployment/export_onnx_n1d7.py \
-  --model-path /tmp/gr00t_custom_3cam/checkpoint-10000
+  --model-path ./outputs/gr00t_custom_3cam/checkpoint-10000
 ```
 
-### 7.2 Build TensorRT pipeline
+Build TensorRT pipeline:
 
 ```bash
 uv run python scripts/deployment/build_trt_pipeline.py
 ```
 
-### 7.3 Benchmark latency on target edge device
+Benchmark:
 
 ```bash
 uv run python scripts/deployment/benchmark_inference.py
 ```
 
-## 8) Real robot inference server/client
-
-Start server (on edge or host with the model):
-
-```bash
-uv run python gr00t/eval/run_gr00t_server.py \
-  --model-path /tmp/gr00t_custom_3cam/checkpoint-10000 \
-  --embodiment-tag NEW_EMBODIMENT \
-  --modality-config-path record/custom_3cam_config.py
-```
-
-Run your robot client loop against the policy server (host/port defaults are `127.0.0.1:5555`).
-
 ---
 
-## Suggested execution checklist
+## End-to-end quick checklist
 
-1. Record 20-50 demo episodes and verify camera sync/state-action quality.
-2. Convert to LeRobot v2 and verify `meta/modality.json`.
-3. Generate stats and run a short (1k-2k step) fine-tune smoke test.
-4. Run open-loop eval and inspect plots.
-5. Scale data and full fine-tune.
-6. Export ONNX -> TensorRT -> benchmark on edge.
-7. Start server and validate closed-loop behavior on robot.
+1. Record demos with correct camera IDs and consistent task text.
+2. Visualize raw episodes and remove bad captures.
+3. Convert raw -> LeRobot -> v2.1 and restore `meta/modality.json`.
+4. Generate stats with `record/custom_3cam_config.py`.
+5. Fine-tune to `./outputs/gr00t_custom_3cam`.
+6. Run open-loop eval.
+7. Start GR00T server from `./outputs/.../checkpoint-10000`.
+8. Validate closed-loop on robot with `record/policy_client_3cam.py`.
 
