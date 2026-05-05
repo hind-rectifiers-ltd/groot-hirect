@@ -57,6 +57,14 @@ class FinetuneConfig:
     tune_diffusion_model: bool = True
     """If True, fine-tune the diffusion-based action decoder (if present in the model)."""
 
+    load_bf16: bool = True
+    """
+    Load the pretrained checkpoint in bfloat16 (frozen backbone weights use less VRAM).
+    Trainable backbone parameters are still promoted to float32 when
+    ``backbone_trainable_params_fp32`` is set in the training stack.
+    Set to False only if you need full float32 loading for debugging.
+    """
+
     state_dropout_prob: float = 0.2
     """
     Dropout probability applied to state inputs for regularization during training.
@@ -110,6 +118,24 @@ class FinetuneConfig:
 
     gradient_accumulation_steps: int = 1
     """Number of forward passes to accumulate before performing a backward/update step."""
+
+    gradient_checkpointing: bool = False
+    """
+    If True, enable gradient checkpointing on the Hugging Face model to trade compute for less VRAM.
+    Helpful for N1.7 3B + multiple cameras on smaller GPUs; combine with a smaller per-device batch.
+    """
+
+    optim: str = "adafactor"
+    """
+    HuggingFace ``TrainingArguments.optim`` name.
+
+    Default is ``adafactor`` so fine-tuning fits consumer GPUs (e.g. 24GB): AdamW keeps full ``exp_avg``
+    and ``exp_avg_sq`` per trainable parameter, which can OOM at the *first* ``optimizer.step()`` even
+    when forward/backward succeed (~1.6B trainable params in N1.7).
+
+    On large GPUs, you can use ``adamw_torch_fused`` or ``adamw_torch``. With ``bitsandbytes`` installed,
+    ``paged_adamw_8bit`` is another option to save optimizer memory while staying close to AdamW.
+    """
 
     output_dir: str = "./outputs"
     """Directory where model checkpoints, logs, and outputs are saved."""

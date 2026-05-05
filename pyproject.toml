@@ -34,6 +34,7 @@ dependencies = [
     "gymnasium==1.2.2",
     "matplotlib==3.10.1",
     "numpy==1.26.4",
+    "h5py>=3.11,<4",
     "omegaconf==2.3.0",
     "scipy==1.15.3",
     # x86_64: PyPI wheel; aarch64 Linux: prebuilt wheel in scripts/deployment/dgpu/wheels/
@@ -41,8 +42,8 @@ dependencies = [
     "torchcodec==0.10.0a0; platform_machine == 'aarch64' and sys_platform == 'linux'",
     "wandb==0.23.0",
     "pyzmq==27.0.1",
-    # deepspeed has no aarch64 Linux wheel
-    "deepspeed==0.17.6; platform_machine != 'aarch64' or sys_platform != 'linux'",
+    # DeepSpeed is optional: accelerate imports it if installed; without CUDA_HOME import fails on many setups.
+    # Single-GPU fine-tune does not need it. Multi-GPU ZeRO: `uv sync --extra deepspeed`
     # triton is needed on aarch64 (GB200) but ships with torch on x86_64
     "triton==3.3.1; sys_platform == 'linux' and platform_machine == 'aarch64'",
     "flash-attn==2.7.4.post1",
@@ -50,9 +51,16 @@ dependencies = [
     # cu12 wheels only exist for x86_64; Blackwell / aarch64 requires cu13.
     "tensorrt-cu12>=10.15.1.29; platform_machine == 'x86_64'",
     "tensorrt-cu13>=10.15.1.29; platform_machine == 'aarch64'",
+    "dynamixel-sdk>=4.0.3",
+    "python-can>=4.6.1",
+    "opencv-python>=4.11.0.86",
 ]
 
 [project.optional-dependencies]
+deepspeed = [
+    # Same platform constraint as before (no aarch64 Linux wheel on PyPI).
+    "deepspeed==0.17.6; platform_machine != 'aarch64' or sys_platform != 'linux'",
+]
 dev = [
     "boto3",
     "ruff",

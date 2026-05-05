@@ -17,6 +17,7 @@ from contextlib import nullcontext
 import os
 from typing import Optional
 
+import torch.utils.checkpoint
 from diffusers import ConfigMixin, ModelMixin
 from diffusers.configuration_utils import register_to_config
 from diffusers.models.attention import Attention, FeedForward
@@ -55,6 +56,23 @@ def _sdpa_context():
         enable_math=True,
         enable_mem_efficient=False,
         enable_cudnn=False,
+    )
+
+
+def _dit_block_forward(
+    block: nn.Module,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    encoder_hidden_states: Optional[torch.Tensor],
+    encoder_attention_mask: Optional[torch.Tensor],
+    temb: Optional[torch.Tensor],
+) -> torch.Tensor:
+    return block(
+        hidden_states,
+        attention_mask=attention_mask,
+        encoder_hidden_states=encoder_hidden_states,
+        encoder_attention_mask=encoder_attention_mask,
+        temb=temb,
     )
 
 
@@ -289,6 +307,47 @@ class DiT(ModelMixin, ConfigMixin):
             sum(p.numel() for p in self.parameters() if p.requires_grad),
         )
 
+    def _run_transformer_block(
+        self,
+        block: nn.Module,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        encoder_hidden_states: Optional[torch.Tensor],
+        encoder_attention_mask: Optional[torch.Tensor],
+        temb: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run one transformer block, optionally with activation checkpointing (big VRAM win on DiT)."""
+        if not getattr(self, "gradient_checkpointing", False) or not self.training:
+            return _dit_block_forward(
+                block,
+                hidden_states,
+                attention_mask,
+                encoder_hidden_states,
+                encoder_attention_mask,
+                temb,
+            )
+        ckpt = getattr(self, "_gradient_checkpointing_func", None)
+        if ckpt is not None:
+            return ckpt(
+                _dit_block_forward,
+                block,
+                hidden_states,
+                attention_mask,
+                encoder_hidden_states,
+                encoder_attention_mask,
+                temb,
+            )
+        return torch.utils.checkpoint.checkpoint(
+            _dit_block_forward,
+            block,
+            hidden_states,
+            attention_mask,
+            encoder_hidden_states,
+            encoder_attention_mask,
+            temb,
+            use_reentrant=False,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,  # Shape: (B, T, D)
@@ -309,20 +368,22 @@ class DiT(ModelMixin, ConfigMixin):
         # Process through transformer blocks
         for idx, block in enumerate(self.transformer_blocks):
             if idx % 2 == 1 and self.config.interleave_self_attention:
-                hidden_states = block(
+                hidden_states = self._run_transformer_block(
+                    block,
                     hidden_states,
-                    attention_mask=None,
-                    encoder_hidden_states=None,
-                    encoder_attention_mask=None,
-                    temb=temb,
+                    None,
+                    None,
+                    None,
+                    temb,
                 )
             else:
-                hidden_states = block(
+                hidden_states = self._run_transformer_block(
+                    block,
                     hidden_states,
-                    attention_mask=None,
-                    encoder_hidden_states=encoder_hidden_states,
-                    encoder_attention_mask=None,
-                    temb=temb,
+                    None,
+                    encoder_hidden_states,
+                    None,
+                    temb,
                 )
             all_hidden_states.append(hidden_states)
 
@@ -379,12 +440,13 @@ class AlternateVLDiT(DiT):
         for idx, block in enumerate(self.transformer_blocks):
             if idx % 2 == 1:
                 # Self-attention blocks
-                hidden_states = block(
+                hidden_states = self._run_transformer_block(
+                    block,
                     hidden_states,
-                    attention_mask=None,
-                    encoder_hidden_states=None,
-                    encoder_attention_mask=None,
-                    temb=temb,
+                    None,
+                    None,
+                    None,
+                    temb,
                 )
             else:
                 # Cross-attention blocks - alternate between non-image and image tokens
@@ -395,12 +457,13 @@ class AlternateVLDiT(DiT):
                     # Attend to image tokens
                     curr_encoder_attention_mask = image_attention_mask
 
-                hidden_states = block(
+                hidden_states = self._run_transformer_block(
+                    block,
                     hidden_states,
-                    attention_mask=None,
-                    encoder_hidden_states=encoder_hidden_states,
-                    encoder_attention_mask=curr_encoder_attention_mask,
-                    temb=temb,
+                    None,
+                    encoder_hidden_states,
+                    curr_encoder_attention_mask,
+                    temb,
                 )
             all_hidden_states.append(hidden_states)
 

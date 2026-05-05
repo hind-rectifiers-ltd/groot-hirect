@@ -11,6 +11,9 @@
 # UV lock file
 uv.lock
 
+# Episode data
+episode_*
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

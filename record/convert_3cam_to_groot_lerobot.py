@@ -22,8 +22,21 @@ from pathlib import Path
 import h5py
 import numpy as np
 import torch
-from lerobot.common.datasets.lerobot_dataset import LEROBOT_HOME, LeRobotDataset
 from tqdm import tqdm
+
+try:
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.utils.constants import HF_LEROBOT_HOME
+except ImportError:
+    # Older pinned installs (pre ~0.4): lerobot.common.datasets
+    from lerobot.common.datasets.lerobot_dataset import (  # type: ignore[no-redef]
+        LEROBOT_HOME as HF_LEROBOT_HOME,
+        LeRobotDataset,
+    )
+
+    HAVE_LEROBOT_NEW_API = False
+else:
+    HAVE_LEROBOT_NEW_API = True
 
 CAMERA_NAMES = ("cam_head", "cam_left_wrist", "cam_right_wrist")
 
@@ -97,7 +110,12 @@ def _write_modality_json(dataset_path: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Convert 3-cam HDF5 episodes to GR00T-compatible LeRobot v2")
     parser.add_argument("--raw-dir", type=Path, required=True)
-    parser.add_argument("--repo-id", type=str, required=True, help="LeRobot repo id path under LEROBOT_HOME")
+    parser.add_argument(
+        "--repo-id",
+        type=str,
+        required=True,
+        help="LeRobot repo id; output is under HF_LEROBOT_HOME (or ~/.cache/huggingface/lerobot if unset)",
+    )
     parser.add_argument("--default-task", type=str, default="demo task")
     parser.add_argument("--robot-type", type=str, default="custom_humanoid")
     parser.add_argument("--fps", type=int, default=30)
@@ -142,7 +160,7 @@ def main() -> None:
             "names": ["channels", "height", "width"],
         }
 
-    dataset_path = LEROBOT_HOME / args.repo_id
+    dataset_path = HF_LEROBOT_HOME / args.repo_id
     if dataset_path.exists() and args.overwrite:
         shutil.rmtree(dataset_path)
     if dataset_path.exists() and not args.overwrite:
@@ -174,10 +192,18 @@ def main() -> None:
                 frame["observation.effort"] = torch.from_numpy(ep["effort"][i])
             for cam in CAMERA_NAMES:
                 frame[f"observation.images.{cam}"] = ep["images"][cam][i]
+            if HAVE_LEROBOT_NEW_API:
+                frame["task"] = task
             ds.add_frame(frame)
-        ds.save_episode(task=task)
+        if HAVE_LEROBOT_NEW_API:
+            ds.save_episode()
+        else:
+            ds.save_episode(task=task)
 
-    ds.consolidate()
+    if HAVE_LEROBOT_NEW_API:
+        ds.finalize()
+    else:
+        ds.consolidate()
     _write_modality_json(dataset_path)
 
     print(f"Saved dataset to: {dataset_path}")

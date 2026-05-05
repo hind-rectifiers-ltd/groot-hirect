@@ -39,6 +39,7 @@ from pathlib import Path
 import random
 from typing import Any
 
+import cv2
 import numpy as np
 import pandas as pd
 
@@ -409,10 +410,19 @@ class LeRobotEpisodeLoader:
         Returns:
             Dictionary mapping camera view names to arrays of decoded frames
         """
-        video_data = {}
+        video_data: dict[str, np.ndarray] = {}
 
-        if not self.video_path_pattern or "video" not in self.modality_configs:
+        if "video" not in self.modality_configs:
             return video_data
+
+        if not self.video_path_pattern:
+            # LeRobot "image" features: frame file paths in parquet, no MP4s (video_path is null).
+            chunk_idx = episode_index // self.chunk_size
+            parquet_path = self.dataset_path / self.data_path_pattern.format(
+                episode_chunk=chunk_idx, episode_index=episode_index
+            )
+            original_df = pd.read_parquet(parquet_path)
+            return self._decode_image_observations(original_df, indices)
 
         chunk_idx = episode_index // self.chunk_size
         image_keys = self.modality_configs["video"].modality_keys
@@ -444,6 +454,82 @@ class LeRobotEpisodeLoader:
                 video_backend_kwargs=self.video_backend_kwargs or {},
             )
 
+        return video_data
+
+    def _image_cell_to_rgb_hwc(self, val: Any) -> np.ndarray:
+        """Convert a LeRobot / HF image cell (path, dict, or CHW array) to HWC uint8 RGB."""
+        if isinstance(val, np.ndarray):
+            arr = val
+            if arr.ndim == 3 and arr.shape[0] in (1, 3) and arr.shape[0] < min(arr.shape[1], arr.shape[2]):
+                arr = np.transpose(arr, (1, 2, 0))
+            if arr.dtype != np.uint8:
+                arr = np.clip(arr, 0, 255).astype(np.uint8)
+            if arr.shape[-1] == 3:
+                return arr
+            raise ValueError(f"Unexpected array image shape/dtype: {arr.shape} {arr.dtype}")
+
+        path_str: str | None = None
+        raw_bytes: bytes | None = None
+        if isinstance(val, (str, Path)):
+            path_str = str(val)
+        elif isinstance(val, dict):
+            path_str = val.get("path")
+            if path_str is None and "paths" in val:
+                p = val["paths"]
+                path_str = p[0] if isinstance(p, (list, tuple)) and p else None
+            b = val.get("bytes")
+            if b is not None and isinstance(b, (bytes, bytearray, memoryview)):
+                raw_bytes = bytes(b)
+        else:
+            raise TypeError(f"Unsupported image cell type {type(val)!r}")
+
+        if raw_bytes is not None:
+            buf = np.frombuffer(raw_bytes, dtype=np.uint8)
+            bgr = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+            if bgr is None:
+                raise ValueError("cv2.imdecode failed for embedded image bytes")
+            return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+        if path_str is None or path_str == "":
+            raise ValueError(f"Image cell has no path or bytes: {type(val)!r}")
+
+        p = Path(path_str)
+        if not p.is_absolute():
+            p = self.dataset_path / p
+        bgr = cv2.imread(str(p))
+        if bgr is None:
+            raise FileNotFoundError(f"Could not read image: {p}")
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+    def _decode_image_observations(
+        self, original_df: pd.DataFrame, indices: np.ndarray
+    ) -> dict[str, np.ndarray]:
+        """Load PNG/JPEG paths from parquet (LeRobot ``dtype: image``) into HWC uint8 arrays."""
+        video_data: dict[str, np.ndarray] = {}
+        image_keys = self.modality_configs["video"].modality_keys
+        for image_key in image_keys:
+            meta_key = self._video_key_mapping.get(image_key, image_key)
+            original_key = self.modality_meta["video"][meta_key].get(
+                "original_key", f"observation.images.{meta_key}"
+            )
+            if original_key not in original_df.columns:
+                raise KeyError(
+                    f"Missing image column {original_key!r} for video key {image_key!r}. "
+                    f"Columns: {list(original_df.columns)}"
+                )
+            ft = self.feature_config.get(original_key, {})
+            dtype = ft.get("dtype")
+            if dtype == "video":
+                raise ValueError(
+                    f"Feature {original_key} is registered as video dtype but info.json has no "
+                    "video_path; re-export with encoded MP4s or use frame image export."
+                )
+
+            rows = original_df.iloc[indices]
+            frames: list[np.ndarray] = []
+            for cell in rows[original_key]:
+                frames.append(self._image_cell_to_rgb_hwc(cell))
+            video_data[image_key] = np.stack(frames, axis=0)
         return video_data
 
     def _load_mask_file(self, mask_path: Path, indices: np.ndarray) -> np.ndarray:
