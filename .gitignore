@@ -12,7 +12,7 @@
 uv.lock
 
 # Episode data
-episode_*
+*.hdf5
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
