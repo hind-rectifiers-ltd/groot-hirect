@@ -31,7 +31,7 @@ Set convenient variables from repo root:
 
 ```bash
 export RAW_DIR=./record/pickplace
-export REPO_ID=my_robot/pickplace_3cam
+export REPO_ID=hirect_humanoid/pickplace_3cam
 export LEROBOT_ROOT=/home/yash/.cache/huggingface/lerobot
 export DS=${LEROBOT_ROOT}/${REPO_ID}
 export FT_OUT=./outputs/gr00t_custom_3cam
