@@ -279,8 +279,8 @@ def main() -> None:
     p.add_argument("--video-cam-head", type=int, default=4)
     p.add_argument("--video-cam-left-wrist", type=int, default=0)
     p.add_argument("--video-cam-right-wrist", type=int, default=8)
-    p.add_argument("--image-height", type=int, default=240)
-    p.add_argument("--image-width", type=int, default=424)
+    p.add_argument("--image-height", type=int, default=640)
+    p.add_argument("--image-width", type=int, default=640)
     p.add_argument("--apply-actions", action="store_true", help="Send decoded targets to RobStride (robstride only)")
     p.add_argument("--dry-run-robstride", action="store_true", help="Init driver but do not write CAN")
     p.add_argument(
