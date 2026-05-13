@@ -37,6 +37,21 @@ export DS=${LEROBOT_ROOT}/${REPO_ID}
 export FT_OUT=./outputs/gr00t_custom_3cam
 ```
 
+If internal disk is tight, keep raw episodes, LeRobot output, HF cache, and checkpoints on an external drive (adjust `SSD` to your mount point):
+
+```bash
+export SSD=/media/yash/T7/pick_place_v1
+export RAW_DIR="${SSD}/pick_place"
+export REPO_ID=hirect_humanoid/pickplace_3cam
+export HF_LEROBOT_HOME="${SSD}/lerobot"
+export LEROBOT_ROOT="${HF_LEROBOT_HOME}"
+export DS="${LEROBOT_ROOT}/${REPO_ID}"
+export FT_OUT="${SSD}/outputs/gr00t_custom_3cam"
+export HF_HOME="${SSD}/huggingface"
+```
+
+`HF_LEROBOT_HOME` is what the LeRobot converter uses; `HF_HOME` routes large Hugging Face / Transformers downloads (e.g. base model) to the SSD. Where the README uses `./outputs/gr00t_custom_3cam`, substitute `"${FT_OUT}"` for checkpoint paths.
+
 ---
 
 ## 1) Record episodes (v2 flow input)
@@ -59,9 +74,9 @@ uv run python record/record_episodes_3cam.py \
   --leader-port /dev/ttyACM0 \
   --leader-baud 57600 \
   --teleop-rate 10 \
-  --video-cam-head 12 \
-  --video-cam-left-wrist 2 \
-  --video-cam-right-wrist 1 \
+  --video-cam-head 8 \
+  --video-cam-left-wrist 0 \
+  --video-cam-right-wrist 4 \
   --task "pick up the object and place it in the tray"
 ```
 
@@ -172,11 +187,12 @@ CUDA_VISIBLE_DEVICES=0 uv run python gr00t/experiment/launch_finetune.py \
   --modality-config-path record/custom_3cam_config.py \
   --num-gpus "${NUM_GPUS}" \
   --output-dir "${FT_OUT}" \
-  --max-steps 10000 \
+  --max-steps 20000 \
   --save-steps 2000 \
   --save-total-limit 5 \
-  --global-batch-size 32 \
-  --dataloader-num-workers 4
+  --global-batch-size 4 \
+  --dataloader-num-workers 2 \
+  --gradient-checkpointing
 ```
 
 Checkpoint example:
@@ -227,9 +243,9 @@ uv run python record/policy_client_3cam.py \
   --port 5555 \
   --task "pick up the object and place it in the tray" \
   --robot robstride \
-  --video-cam-head 12 \
-  --video-cam-left-wrist 2 \
-  --video-cam-right-wrist 1 \
+  --video-cam-head 8 \
+  --video-cam-left-wrist 4 \
+  --video-cam-right-wrist 0 \
   --apply-actions
 ```
 
