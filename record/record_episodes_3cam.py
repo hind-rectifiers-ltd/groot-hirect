@@ -272,6 +272,15 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
                 ramp_dt_max_s=dt.ROBSTRIDE_RAMP_DT_MAX_S,
             )
             self._arm.connect()
+            # Pre-flight: refuse to record unless the follower is already at home.
+            # Ensures the recorded trajectory starts from a known zero pose so we
+            # do not save ramp-from-arbitrary-pose noise as the first frames.
+            try:
+                self._verify_zero_pose()
+            except Exception:
+                # Tear down everything opened so far so the process exits clean.
+                self._cleanup_partial_init()
+                raise
 
         self._qpos12 = np.zeros(12, dtype=np.float32)
         self._action12 = np.zeros(12, dtype=np.float32)
@@ -283,6 +292,66 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
             daemon=True,
         )
         self._thread.start()
+
+    def _verify_zero_pose(
+        self,
+        *,
+        low: float = -0.1,
+        high: float = 0.1,
+        settle_reads: int = 3,
+    ) -> None:
+        """
+        Pre-flight check: every follower motor must be at home (qpos in [low, high]).
+
+        The first ``read_joints12`` after ``connect`` may surface stale frames; we
+        therefore read ``settle_reads`` times (drain + per-motor retry are already
+        enabled inside ``ActuatorController``) and judge the last read.
+
+        Raises RuntimeError naming each motor that is not at zero so the user knows
+        exactly which arm joint to home before re-running.
+        """
+        assert self._arm is not None, "ActuatorController must be connected"
+        qpos = np.zeros(12, dtype=np.float64)
+        for _ in range(max(1, settle_reads)):
+            qpos = self._arm.read_joints12()
+
+        motor_ids = list(self._dt.LEFT_ROBSTRIDE_IDS) + list(self._dt.RIGHT_ROBSTRIDE_IDS)
+        out_of_range: list[tuple[int, float]] = []
+        for i, mid in enumerate(motor_ids):
+            v = float(qpos[i])
+            if not (low <= v <= high):
+                out_of_range.append((mid, v))
+
+        if out_of_range:
+            details = "\n".join(
+                f"  motor id {mid} is not zero (qpos={v:+.4f} rad, allowed range [{low}, {high}])"
+                for mid, v in out_of_range
+            )
+            raise RuntimeError(
+                "Follower pre-teleop zero-pose check failed:\n"
+                + details
+                + "\nMove the follower arm(s) back to home position (~0 rad) and re-run."
+            )
+
+        qpos_str = ", ".join(f"{float(v):+.4f}" for v in qpos)
+        print(f"[record] Follower zero-pose check OK: qpos=[{qpos_str}]", flush=True)
+
+    def _cleanup_partial_init(self) -> None:
+        """Release any resources opened in __init__, used when a constructor check fails."""
+        if self._arm is not None:
+            try:
+                self._arm.disconnect(send_zero=False)
+            except Exception:
+                pass
+            self._arm = None
+        try:
+            self._connector.closePort()
+        except Exception:
+            pass
+        try:
+            super().close()
+        except Exception:
+            pass
 
     def _teleop_loop(self, control_rate: float) -> None:
         dt = self._dt
@@ -585,16 +654,23 @@ def main() -> None:
             image_shape=(args.image_height, args.image_width),
         )
     else:
-        robot = DirectTeleopRobotInterface(
-            cam_head_device=args.video_cam_head,
-            cam_left_wrist_device=args.video_cam_left_wrist,
-            cam_right_wrist_device=args.video_cam_right_wrist,
-            leader_port=args.leader_port,
-            leader_baud=args.leader_baud,
-            control_rate=args.teleop_rate,
-            dry_run=args.dry_run_teleop,
-            image_shape=(args.image_height, args.image_width),
-        )
+        try:
+            robot = DirectTeleopRobotInterface(
+                cam_head_device=args.video_cam_head,
+                cam_left_wrist_device=args.video_cam_left_wrist,
+                cam_right_wrist_device=args.video_cam_right_wrist,
+                leader_port=args.leader_port,
+                leader_baud=args.leader_baud,
+                control_rate=args.teleop_rate,
+                dry_run=args.dry_run_teleop,
+                image_shape=(args.image_height, args.image_width),
+            )
+        except RuntimeError as exc:
+            # Pre-flight zero-pose check (or other init validation) failed: print and exit
+            # cleanly without recording anything.  Resources are already released by
+            # DirectTeleopRobotInterface._cleanup_partial_init.
+            print(f"\nERROR: {exc}", file=sys.stderr, flush=True)
+            sys.exit(1)
 
     ep_idx = args.episode_idx if args.episode_idx is not None else get_next_episode_index(args.output_dir)
     out = args.output_dir / f"episode_{ep_idx:06d}.hdf5"

@@ -35,6 +35,9 @@ export REPO_ID=hirect_humanoid/pickplace_3cam
 export LEROBOT_ROOT=/home/yash/.cache/huggingface/lerobot
 export DS=${LEROBOT_ROOT}/${REPO_ID}
 export FT_OUT=./outputs/gr00t_custom_3cam
+export CKPT="${FT_OUT}/checkpoint-12000"
+# Tip: auto-pick the latest checkpoint after training:
+#   export CKPT="$(ls -d "${FT_OUT}"/checkpoint-* | sort -V | tail -n1)"
 ```
 
 If internal disk is tight, keep raw episodes, LeRobot output, HF cache, and checkpoints on an external drive (adjust `SSD` to your mount point):
@@ -48,9 +51,12 @@ export LEROBOT_ROOT="${HF_LEROBOT_HOME}"
 export DS="${LEROBOT_ROOT}/${REPO_ID}"
 export FT_OUT="${SSD}/outputs/gr00t_custom_3cam"
 export HF_HOME="${SSD}/huggingface"
+export CKPT="${FT_OUT}/checkpoint-10000"
+# Tip: auto-pick the latest checkpoint after training:
+#   export CKPT="$(ls -d "${FT_OUT}"/checkpoint-* | sort -V | tail -n1)"
 ```
 
-`HF_LEROBOT_HOME` is what the LeRobot converter uses; `HF_HOME` routes large Hugging Face / Transformers downloads (e.g. base model) to the SSD. Where the README uses `./outputs/gr00t_custom_3cam`, substitute `"${FT_OUT}"` for checkpoint paths.
+`HF_LEROBOT_HOME` is what the LeRobot converter uses; `HF_HOME` routes large Hugging Face / Transformers downloads (e.g. base model) to the SSD. `FT_OUT` is the training output directory and `CKPT` points to one specific checkpoint inside it — use `"${CKPT}"` everywhere the README needs a checkpoint path. Update the checkpoint number whenever you train further (or use the `ls`-based tip above).
 
 ---
 
@@ -197,9 +203,9 @@ CUDA_VISIBLE_DEVICES=0 uv run python gr00t/experiment/launch_finetune.py \
 
 Checkpoint example:
 
-- `./outputs/gr00t_custom_3cam/checkpoint-10000`
+- `"${FT_OUT}/checkpoint-12000"` (i.e. `"${CKPT}"` from the export block)
 
-Use `./outputs` (inside repo) instead of `/tmp` so checkpoints are persistent.
+Use `./outputs` (inside repo) or the SSD path instead of `/tmp` so checkpoints are persistent.
 
 ---
 
@@ -209,7 +215,7 @@ Use `./outputs` (inside repo) instead of `/tmp` so checkpoints are persistent.
 uv run python gr00t/eval/open_loop_eval.py \
   --dataset-path "${DS}" \
   --embodiment-tag NEW_EMBODIMENT \
-  --model-path ./outputs/gr00t_custom_3cam/checkpoint-10000 \
+  --model-path "${CKPT}" \
   --traj-ids 0 1 2 \
   --action-horizon 16 \
   --steps 300
@@ -223,7 +229,7 @@ If predictions diverge strongly from GT, improve data quality/coverage before ha
 
 ```bash
 uv run python gr00t/eval/run_gr00t_server.py \
-  --model-path ./outputs/gr00t_custom_3cam/checkpoint-10000 \
+  --model-path "${CKPT}" \
   --embodiment-tag NEW_EMBODIMENT \
   --modality-config-path record/custom_3cam_config.py \
   --device cuda \
@@ -270,7 +276,7 @@ Export ONNX:
 
 ```bash
 uv run python scripts/deployment/export_onnx_n1d7.py \
-  --model-path ./outputs/gr00t_custom_3cam/checkpoint-10000
+  --model-path "${CKPT}"
 ```
 
 Build TensorRT pipeline:
@@ -293,8 +299,8 @@ uv run python scripts/deployment/benchmark_inference.py
 2. Visualize raw episodes and remove bad captures.
 3. Convert raw -> LeRobot -> v2.1 and restore `meta/modality.json`.
 4. Generate stats with `record/custom_3cam_config.py`.
-5. Fine-tune to `./outputs/gr00t_custom_3cam`.
-6. Run open-loop eval.
-7. Start GR00T server from `./outputs/.../checkpoint-10000`.
+5. Fine-tune to `"${FT_OUT}"`.
+6. Run open-loop eval with `--model-path "${CKPT}"`.
+7. Start GR00T server with `--model-path "${CKPT}"`.
 8. Validate closed-loop on robot with `record/policy_client_3cam.py`.
 
