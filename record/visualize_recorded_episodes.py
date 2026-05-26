@@ -248,6 +248,30 @@ def opencv_gui_available() -> bool:
         return False
 
 
+def _format_qpos_lines(qpos_row: np.ndarray, precision: int = 4) -> list[str]:
+    """
+    Format a qpos vector as one-or-more compact lines for on-image overlay.
+
+    - 12-D vectors are split into left arm and right arm rows using the standard labels.
+    - Other dimensions are split into chunks of up to 6 joints per line.
+    - Decimal output (no scientific notation), with a leading sign so columns line up.
+    """
+    arr = np.asarray(qpos_row, dtype=np.float64).reshape(-1)
+    dim = arr.size
+    labels = _joint_labels(dim)
+    chunk = 6  # joints per row
+
+    def fmt(label: str, v: float) -> str:
+        return f"{label}={v:+.{precision}f}"
+
+    lines: list[str] = []
+    for start in range(0, dim, chunk):
+        end = min(start + chunk, dim)
+        row = "  ".join(fmt(labels[i], float(arr[i])) for i in range(start, end))
+        lines.append(row)
+    return lines
+
+
 def build_frame_strip(
     images: dict[str, np.ndarray],
     frame_idx: int,
@@ -258,7 +282,6 @@ def build_frame_strip(
 ) -> np.ndarray:
     """BGR strip with text overlay for OpenCV imshow / VideoWriter."""
     strip = build_rgb_strip_tiles(images, frame_idx, target_h=target_h)
-    # Overlay text (BGR for OpenCV)
     try:
         import cv2
 
@@ -276,10 +299,21 @@ def build_frame_strip(
         y += 26
         task_show = task.replace("\n", " ")[:120]
         cv2.putText(out, task_show, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-        if qpos_row is not None and len(qpos_row) >= 4:
-            y += 22
-            summary = "qpos[:4]=" + str([round(float(x), 3) for x in qpos_row[:4]])
-            cv2.putText(out, summary, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+        if qpos_row is not None and len(qpos_row) > 0:
+            y += 24
+            cv2.putText(out, "qpos:", (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            line_h = 20
+            for line in _format_qpos_lines(qpos_row):
+                y += line_h
+                cv2.putText(
+                    out,
+                    line,
+                    (8, y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (200, 200, 200),
+                    1,
+                )
         return out
     except ImportError:
         return strip
@@ -331,11 +365,13 @@ def run_viewer_matplotlib(
         ax_img.clear()
         ax_img.imshow(rgb)
         ax_img.axis("off")
-        ax_img.set_title(
-            f"{episodes[ei].stem}  frame {fi}/{max(d['length'] - 1, 0)}\n{d['task'][:100]}",
-            fontsize=10,
-            loc="left",
-        )
+        title_lines = [
+            f"{episodes[ei].stem}  frame {fi}/{max(d['length'] - 1, 0)}",
+            d["task"][:100],
+        ]
+        if len(d["qpos"]) > fi:
+            title_lines.append("qpos: " + "  |  ".join(_format_qpos_lines(d["qpos"][fi])))
+        ax_img.set_title("\n".join(title_lines), fontsize=9, loc="left")
         if len(d["qpos"]) and len(d["action"]):
             plot_qpos_action_on_axes(ax_q, ax_a, d["qpos"], d["action"], fi)
         else:

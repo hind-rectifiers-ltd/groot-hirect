@@ -194,6 +194,12 @@ class ActuatorController:
         self._last_cmd_t: float | None = None
         self._connected = False
 
+        # Read stats — useful when MIT writes and register reads compete for the bus.
+        self._read_calls = 0       # number of times read_joints12() was invoked
+        self._read_attempts = 0    # per-joint attempts (12 per call when both buses are live)
+        self._read_failures = 0    # per-joint failures (left at 0.0)
+        self._rx_frames_drained = 0  # cumulative stale frames flushed before reads
+
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
@@ -332,26 +338,137 @@ class ActuatorController:
     # Convenience: read current mechanical positions
     # ------------------------------------------------------------------
 
-    def read_joints12(self) -> np.ndarray:
+    def _drain_bus_rx(
+        self,
+        bus,
+        *,
+        max_frames: int = 256,
+        settle_timeout_s: float = 0.002,
+        settle_passes: int = 3,
+    ) -> int:
+        """
+        Flush leftover frames from the python-can RX queue (typically stale OPERATION_STATUS
+        frames produced by recent write_operation_frame calls).  Returns count drained.
+
+        Without this, ``bus.read(MECHANICAL_POSITION)`` consumes the queue head, which is a
+        stale status frame, raises AssertionError, and the register-read response is lost.
+        After ~70 cycles the queue is permanently full of stale frames and every read fails.
+
+        We bypass ``RobstrideBus.receive()`` and talk to the underlying ``python-can`` Bus
+        directly because the vendor ``receive(timeout=0.0)`` is buggy when the queue is
+        empty (its while-loop never executes and ``frame`` is referenced unbound).
+
+        Strategy:
+          1. Greedy non-blocking drain to flush whatever is already queued.
+          2. Up to ``settle_passes`` short blocking polls (``settle_timeout_s`` each) to
+             catch frames that are still in flight from the most recent write burst.
+        """
+        if bus is None:
+            return 0
+        handler = getattr(bus, "channel_handler", None)
+        if handler is None:
+            return 0
+        drained = 0
+
+        # Phase 1: greedy non-blocking drain.
+        for _ in range(max_frames):
+            try:
+                frame = handler.recv(timeout=0.0)
+            except Exception:
+                break
+            if frame is None:
+                break
+            drained += 1
+
+        # Phase 2: short blocking polls to catch in-flight frames from recent writes.
+        for _ in range(max(0, settle_passes)):
+            try:
+                frame = handler.recv(timeout=settle_timeout_s)
+            except Exception:
+                break
+            if frame is None:
+                break
+            drained += 1
+            # Continue greedy after finding one — more may have queued up.
+            for _ in range(max_frames):
+                try:
+                    f2 = handler.recv(timeout=0.0)
+                except Exception:
+                    break
+                if f2 is None:
+                    break
+                drained += 1
+
+        self._rx_frames_drained += drained
+        return drained
+
+    def _read_one_with_retry(self, bus, name: str, *, max_retries: int = 2) -> float:
+        """
+        Read MECHANICAL_POSITION for a single motor with self-healing retry.
+
+        Vendor ``bus.read()`` blocks reading the next frame and asserts it's a
+        READ_PARAMETER reply.  If a stale OPERATION_STATUS arrives first, the assertion
+        fails and the actual read reply gets stuck behind it.  We catch that, peel one
+        stale frame off the RX queue (one retry per stale frame), and try again.
+        """
+        self._read_attempts += 1
+        last_exc: Exception | None = None
+        for attempt in range(max_retries + 1):
+            try:
+                return float(bus.read(name, self._ParameterType.MECHANICAL_POSITION))
+            except Exception as exc:
+                last_exc = exc
+                # Peel one frame off — the next iteration's read will then have the
+                # correct response (the one our previous transmit asked for) at the
+                # queue head, OR another stale frame which we will peel again.
+                handler = getattr(bus, "channel_handler", None)
+                if handler is None:
+                    break
+                try:
+                    handler.recv(timeout=0.002)
+                except Exception:
+                    pass
+                self._rx_frames_drained += 1
+        self._read_failures += 1
+        _ = last_exc  # kept for future debugging
+        return 0.0
+
+    def read_joints12(self, *, drain_rx: bool = True) -> np.ndarray:
         """
         Read MECHANICAL_POSITION for all 12 joints.  Failed reads stay 0.0.
+
+        Args:
+            drain_rx: If True (default), flush stale frames from each bus's RX queue
+                      before issuing register reads.  Strongly recommended when called
+                      after ``command_joints12`` on the same bus.
         """
         if not self._connected:
             raise RuntimeError("[move_actuators] Not connected.")
+        self._read_calls += 1
         out = np.zeros(NUM_JOINTS, dtype=np.float64)
-        for i, (name, _) in enumerate(self._left_motors):
-            if self._left_bus:
-                try:
-                    out[i] = float(self._left_bus.read(name, self._ParameterType.MECHANICAL_POSITION))
-                except Exception:
-                    pass
-        for i, (name, _) in enumerate(self._right_motors):
-            if self._right_bus:
-                try:
-                    out[6 + i] = float(self._right_bus.read(name, self._ParameterType.MECHANICAL_POSITION))
-                except Exception:
-                    pass
+
+        if drain_rx:
+            self._drain_bus_rx(self._left_bus)
+        if self._left_bus is not None:
+            for i, (name, _) in enumerate(self._left_motors):
+                out[i] = self._read_one_with_retry(self._left_bus, name)
+
+        if drain_rx:
+            self._drain_bus_rx(self._right_bus)
+        if self._right_bus is not None:
+            for i, (name, _) in enumerate(self._right_motors):
+                out[6 + i] = self._read_one_with_retry(self._right_bus, name)
+
         return out
+
+    def read_stats_line(self) -> str:
+        """One-line summary of read reliability since connect()."""
+        bad_pct = 100.0 * self._read_failures / max(self._read_attempts, 1)
+        return (
+            f"[move_actuators] read stats: calls={self._read_calls} "
+            f"attempts={self._read_attempts} failures={self._read_failures} "
+            f"({bad_pct:.1f}%) rx_frames_drained={self._rx_frames_drained}"
+        )
 
 
 # ---------------------------------------------------------------------------

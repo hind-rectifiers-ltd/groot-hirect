@@ -167,8 +167,14 @@ def main():
     parser.add_argument("--print-every", type=int, default=1)
     parser.add_argument("--dry-run", action="store_true",
                         help="Read leader and compute targets but do not command follower motors")
+    parser.add_argument("--no-print-follower", action="store_true",
+                        help="Suppress the simple follower qpos line printed under each leader line "
+                             "(uses arm.read_joints12, same as scripts/read_follower_joints.py).")
+    parser.add_argument("--print-follower-precision", type=int, default=4,
+                        help="Decimals for the simple follower line (default 4).")
     parser.add_argument("--print-follower-qpos", action="store_true",
-                        help="On each --print-every loop, read follower qpos via follower_qpos_reader and print.")
+                        help="On each --print-every loop, read follower qpos via follower_qpos_reader "
+                             "(retries + MIT fallback) and print the full diagnostic block.")
     parser.add_argument("--print-follower-qpos-precision", type=int, default=4)
     parser.add_argument("--follower-qpos-after-writes", action="store_true",
                         help="Read encoders after MIT writes (legacy; more CAN contention).")
@@ -328,11 +334,21 @@ def main():
 
             loops += 1
             if args.print_every > 0 and loops % args.print_every == 0:
-                msg = f"[direct] loop #{loops} leader[:12]={[round(x, 2) for x in a12]}"
+                leader_str = "[" + ", ".join(f"{x:.2f}" for x in a12) + "]"
+                msg = f"[direct] loop #{loops} leader[:12]={leader_str}"
                 if args.dry_run:
                     preview = {k: round(v, 4) for k, v in list(ramped_cmd.items())[:4]}
                     msg += f" | target_preview={preview}"
                 print(msg)
+                # Simple follower line (matches scripts/read_follower_joints.py behavior).
+                if not args.no_print_follower and arm is not None:
+                    try:
+                        fq = arm.read_joints12()
+                        prec = max(0, args.print_follower_precision)
+                        follower_str = ", ".join(f"{float(v):.{prec}f}" for v in fq)
+                        print(f"             follower[:12]=[{follower_str}]")
+                    except Exception as e:
+                        print(f"             follower[:12] read failed: {e}")
                 if args.print_follower_qpos:
                     action12 = ramped_cmd_to_action12(left_motors, right_motors, ramped_cmd)
                     qpos12 = (
@@ -356,6 +372,10 @@ def main():
         if qpos_reader is not None:
             print(qpos_reader.stats_line(), flush=True)
         if arm is not None:
+            try:
+                print(arm.read_stats_line(), flush=True)
+            except Exception:
+                pass
             arm.disconnect()
             print("RobStride buses disconnected.")
         try:

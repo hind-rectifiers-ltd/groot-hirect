@@ -206,9 +206,14 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
     """
     3-camera backend + direct local teleop loop (leader Dynamixel -> follower RobStride).
 
+    Motor I/O is delegated to ``move_actuators.ActuatorController``, which handles the
+    write-then-drain-then-read pipeline with per-motor retry that was validated in
+    ``direct_teleop.py``.  This eliminates the qpos-drop-to-zero failure mode caused by
+    stale OPERATION_STATUS frames sitting in the python-can RX queue.
+
     Records:
-      - qpos: follower mechanical positions (12D)
-      - action: ramp-limited commanded follower targets (12D)
+      - qpos: follower mechanical positions (12D), read via ActuatorController.read_joints12
+      - action: ramp-limited commanded follower targets (12D), produced by command_joints12
     """
 
     LEFT_SERVO_INDICES = [0, 2, 4, 6, 8, 10]
@@ -237,19 +242,13 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
         if str(self._repo_root) not in sys.path:
             sys.path.insert(0, str(self._repo_root))
         import direct_teleop as dt
+        from move_actuators import ActuatorController
 
         self._dt = dt
         dt.ensure_import_paths(self._repo_root)
 
         from dynamixel_easy_sdk import Connector
 
-        try:
-            from robstride_dynamics import Motor, ParameterType, RobstrideBus
-        except Exception:
-            from robstride_dynamics.bus import Motor, RobstrideBus
-            from robstride_dynamics.protocol import ParameterType
-
-        self._ParameterType = ParameterType
         self._connector = Connector(leader_port, leader_baud)
         self._leader_motors = self._connector.createAllMotors()
         if not self._leader_motors:
@@ -261,25 +260,18 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
             except Exception:
                 pass
 
-        self._dry_run = dry_run
-        self._left_bus = self._right_bus = None
-        self._left_motors = [(f"motor_{mid}", mid) for mid in dt.LEFT_ROBSTRIDE_IDS]
-        self._right_motors = [(f"motor_{mid}", mid) for mid in dt.RIGHT_ROBSTRIDE_IDS]
-        if not dry_run:
-            self._left_bus, self._left_motors = dt.init_robstride_bus(
-                RobstrideBus,
-                Motor,
-                ParameterType,
-                dt.LEFT_CAN,
-                dt.LEFT_ROBSTRIDE_IDS,
+        self._dry_run = bool(dry_run)
+        self._left_motors_meta = [(f"motor_{mid}", mid) for mid in dt.LEFT_ROBSTRIDE_IDS]
+        self._right_motors_meta = [(f"motor_{mid}", mid) for mid in dt.RIGHT_ROBSTRIDE_IDS]
+
+        self._arm: ActuatorController | None = None
+        if not self._dry_run:
+            self._arm = ActuatorController(
+                ramp=True,
+                ramp_max_speed_rad_s=dt.ROBSTRIDE_RAMP_MAX_SPEED_RAD_S,
+                ramp_dt_max_s=dt.ROBSTRIDE_RAMP_DT_MAX_S,
             )
-            self._right_bus, self._right_motors = dt.init_robstride_bus(
-                RobstrideBus,
-                Motor,
-                ParameterType,
-                dt.RIGHT_CAN,
-                dt.RIGHT_ROBSTRIDE_IDS,
-            )
+            self._arm.connect()
 
         self._qpos12 = np.zeros(12, dtype=np.float32)
         self._action12 = np.zeros(12, dtype=np.float32)
@@ -292,33 +284,13 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
         )
         self._thread.start()
 
-    def _read_follower_qpos12(self) -> np.ndarray:
-        out = np.zeros(12, dtype=np.float32)
-        for i, (name, _mid) in enumerate(self._left_motors):
-            if self._left_bus is None:
-                continue
-            try:
-                out[i] = float(self._left_bus.read(name, self._ParameterType.MECHANICAL_POSITION))
-            except Exception:
-                pass
-        for i, (name, _mid) in enumerate(self._right_motors):
-            if self._right_bus is None:
-                continue
-            try:
-                out[6 + i] = float(self._right_bus.read(name, self._ParameterType.MECHANICAL_POSITION))
-            except Exception:
-                pass
-        return out
-
     def _teleop_loop(self, control_rate: float) -> None:
         dt = self._dt
         period = 1.0 / max(control_rate, 1e-3)
         teleop_initialized = False
         prev_servo = [0.0] * 12
         accum = [0.0] * 12
-        robstride_ref = {}
-        ramped_cmd = {}
-        last_ramp_t = None
+        robstride_ref = np.zeros(12, dtype=np.float64)
 
         while not self._stop_event.is_set():
             t0 = time.monotonic()
@@ -329,93 +301,45 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
                 continue
 
             if not teleop_initialized:
-                for motor_name, _mid in self._left_motors:
-                    if self._left_bus:
-                        try:
-                            robstride_ref[motor_name] = self._left_bus.read(
-                                motor_name, self._ParameterType.MECHANICAL_POSITION
-                            )
-                        except Exception:
-                            robstride_ref[motor_name] = 0.0
-                    else:
-                        robstride_ref[motor_name] = 0.0
-                for motor_name, _mid in self._right_motors:
-                    if self._right_bus:
-                        try:
-                            robstride_ref[motor_name] = self._right_bus.read(
-                                motor_name, self._ParameterType.MECHANICAL_POSITION
-                            )
-                        except Exception:
-                            robstride_ref[motor_name] = 0.0
-                    else:
-                        robstride_ref[motor_name] = 0.0
+                if self._arm is not None:
+                    robstride_ref = self._arm.read_joints12().astype(np.float64)
                 prev_servo = list(a12)
                 teleop_initialized = True
-                ramped_cmd = {name: float(robstride_ref.get(name, 0.0)) for name, _ in self._left_motors + self._right_motors}
-                last_ramp_t = time.monotonic()
+                # Seed published state with the initial follower pose.
+                with self._lock:
+                    self._qpos12[:] = robstride_ref.astype(np.float32)
+                    self._action12[:] = robstride_ref.astype(np.float32)
                 continue
 
+            # Accumulate leader-side servo deltas (in raw servo units).
             for i in range(12):
                 accum[i] += dt.shortest_delta_units(prev_servo[i], a12[i])
                 prev_servo[i] = a12[i]
 
-            now = time.monotonic()
-            if last_ramp_t is None:
-                last_ramp_t = now
-            ramp_dt = max(1e-4, min(now - last_ramp_t, dt.ROBSTRIDE_RAMP_DT_MAX_S))
-            last_ramp_t = now
-            max_step = dt.ROBSTRIDE_RAMP_MAX_SPEED_RAD_S * ramp_dt
-
-            for (motor_name, motor_id), servo_idx in zip(self._left_motors, self.LEFT_SERVO_INDICES):
-                base = robstride_ref.get(motor_name, 0.0)
+            # Compute 12-vector follower targets (initial ref + accumulated delta).
+            targets = np.zeros(12, dtype=np.float64)
+            for i, (_, motor_id) in enumerate(self._left_motors_meta):
+                servo_idx = self.LEFT_SERVO_INDICES[i]
                 d_rad = dt.accum_units_to_target_delta_rad(accum[servo_idx], motor_id, servo_idx)
-                desired = base + d_rad
-                prev_cmd = ramped_cmd.get(motor_name, desired)
-                target = dt.ramp_toward(prev_cmd, desired, max_step)
-                ramped_cmd[motor_name] = target
-                if self._left_bus:
-                    try:
-                        self._left_bus.write_operation_frame(
-                            motor_name,
-                            target,
-                            dt.MOTOR_KP[motor_id],
-                            dt.MOTOR_KD[motor_id],
-                            0.0,
-                            0.0,
-                        )
-                    except Exception:
-                        pass
-
-            for (motor_name, motor_id), servo_idx in zip(self._right_motors, self.RIGHT_SERVO_INDICES):
-                base = robstride_ref.get(motor_name, 0.0)
+                targets[i] = robstride_ref[i] + d_rad
+            for i, (_, motor_id) in enumerate(self._right_motors_meta):
+                servo_idx = self.RIGHT_SERVO_INDICES[i]
                 d_rad = dt.accum_units_to_target_delta_rad(accum[servo_idx], motor_id, servo_idx)
-                desired = base + d_rad
-                prev_cmd = ramped_cmd.get(motor_name, desired)
-                target = dt.ramp_toward(prev_cmd, desired, max_step)
-                ramped_cmd[motor_name] = target
-                if self._right_bus:
-                    try:
-                        self._right_bus.write_operation_frame(
-                            motor_name,
-                            target,
-                            dt.MOTOR_KP[motor_id],
-                            dt.MOTOR_KD[motor_id],
-                            0.0,
-                            0.0,
-                        )
-                    except Exception:
-                        pass
+                targets[6 + i] = robstride_ref[6 + i] + d_rad
 
-            action = np.zeros(12, dtype=np.float32)
-            for i, (name, _mid) in enumerate(self._left_motors):
-                action[i] = float(ramped_cmd.get(name, 0.0))
-            for i, (name, _mid) in enumerate(self._right_motors):
-                action[6 + i] = float(ramped_cmd.get(name, 0.0))
-            qpos = self._read_follower_qpos12()
+            # Command + read via ActuatorController:
+            #   - command_joints12 ramps internally and returns the ramped targets (= action).
+            #   - read_joints12 drains stale OPERATION_STATUS frames and retries per motor.
+            if self._arm is not None:
+                sent = self._arm.command_joints12(targets, ramp=True)
+                qpos = self._arm.read_joints12()
+            else:
+                sent = targets
+                qpos = np.zeros(12, dtype=np.float64)
 
             with self._lock:
-                self._action12[:] = action
-                self._qpos12[:] = qpos
+                self._action12[:] = sent.astype(np.float32)
+                self._qpos12[:] = qpos.astype(np.float32)
 
             elapsed = time.monotonic() - t0
             sleep_s = period - elapsed
@@ -438,17 +362,16 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
         self._stop_event.set()
         if hasattr(self, "_thread") and self._thread.is_alive():
             self._thread.join(timeout=2.0)
-        for bus, motors in [(self._left_bus, self._left_motors), (self._right_bus, self._right_motors)]:
-            if bus and motors:
-                try:
-                    for motor_name, _ in motors:
-                        bus.write_operation_frame(motor_name, 0.0, 0.0, 0.0, 0.0, 0.0)
-                    time.sleep(0.2)
-                    for motor_name, _ in motors:
-                        bus.disable(motor_name)
-                    bus.disconnect()
-                except Exception:
-                    pass
+        if self._arm is not None:
+            try:
+                print(self._arm.read_stats_line(), flush=True)
+            except Exception:
+                pass
+            try:
+                self._arm.disconnect(send_zero=True)
+            except Exception:
+                pass
+            self._arm = None
         try:
             self._connector.closePort()
         except Exception:
