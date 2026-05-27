@@ -134,7 +134,17 @@ def _import_record_interfaces():
 
 
 class PolicyRobstrideDriver:
-    """Minimal follower commander: RobStride buses + ramped MIT targets (no leader teleop)."""
+    """Minimal follower commander: ramped MIT targets via ``ActuatorController`` (no leader teleop).
+
+    Adds two safety features for inference:
+      * **Software auto-zero**: at connect, any joint reading > +π or < -π (i.e. the multi-turn
+        encoder reported one wrap away from home) gets a one-turn offset.  All subsequent reads
+        return the unwrapped value, and all commands have the offset added back before being
+        sent to the motor.  This makes the policy see a clean ``≈0 rad`` home pose even after
+        a power cycle wraps the encoder.
+      * **Zero-pose check** (:meth:`verify_zero_pose`): refuse to start inference unless every
+        joint (after software unwrap) sits within ``[-0.2, +0.2] rad``.
+    """
 
     def __init__(
         self,
@@ -142,128 +152,167 @@ class PolicyRobstrideDriver:
         *,
         ramp_max_speed_rad_s: float | None = 2.5,
         ramp_from_feedback: bool = False,
+        auto_zero: bool = True,
     ):
         if str(_REPO_ROOT) not in sys.path:
             sys.path.insert(0, str(_REPO_ROOT))
         import direct_teleop as dt
 
         dt.ensure_import_paths(_REPO_ROOT)
-
-        try:
-            from robstride_dynamics import Motor, ParameterType, RobstrideBus
-        except Exception:
-            from robstride_dynamics.bus import Motor, RobstrideBus
-            from robstride_dynamics.protocol import ParameterType
+        from move_actuators import (
+            LEFT_ROBSTRIDE_IDS,
+            RIGHT_ROBSTRIDE_IDS,
+            ActuatorController,
+        )
 
         self._dt = dt
-        self._ParameterType = ParameterType
         self._dry_run = dry_run
-        self._left_bus = self._right_bus = None
-        self._left_motors: list[tuple[str, int]] = []
-        self._right_motors: list[tuple[str, int]] = []
-        self._ramped: dict[str, float] = {}
-        # None -> use direct_teleop.ROBSTRIDE_RAMP_MAX_SPEED_RAD_S (typically 6.0)
-        self._ramp_max_speed_rad_s = ramp_max_speed_rad_s
         self._ramp_from_feedback = ramp_from_feedback
+        self._ramp_max_speed_rad_s = ramp_max_speed_rad_s
+        self._motor_ids: list[int] = list(LEFT_ROBSTRIDE_IDS) + list(RIGHT_ROBSTRIDE_IDS)
+        # One-turn-unwrap offsets in the motor's encoder frame: read_qpos12 returns
+        # (raw - boot_offsets); command_a12 sends (target + boot_offsets).
+        self._boot_offsets: np.ndarray = np.zeros(12, dtype=np.float64)
+        self._arm: ActuatorController | None = None
 
         if not dry_run:
-            self._left_bus, self._left_motors = dt.init_robstride_bus(
-                RobstrideBus, Motor, ParameterType, dt.LEFT_CAN, dt.LEFT_ROBSTRIDE_IDS
+            ramp_speed = (
+                float(ramp_max_speed_rad_s)
+                if ramp_max_speed_rad_s is not None
+                else float(dt.ROBSTRIDE_RAMP_MAX_SPEED_RAD_S)
             )
-            self._right_bus, self._right_motors = dt.init_robstride_bus(
-                RobstrideBus, Motor, ParameterType, dt.RIGHT_CAN, dt.RIGHT_ROBSTRIDE_IDS
+            self._arm = ActuatorController(
+                ramp=True,
+                ramp_max_speed_rad_s=ramp_speed,
+                ramp_dt_max_s=float(dt.ROBSTRIDE_RAMP_DT_MAX_S),
             )
-
-    def read_qpos12(self) -> np.ndarray:
-        out = np.zeros(12, dtype=np.float32)
-        for i, (name, _mid) in enumerate(self._left_motors):
-            if self._left_bus is None:
-                continue
             try:
-                out[i] = float(self._left_bus.read(name, self._ParameterType.MECHANICAL_POSITION))
+                self._arm.connect()
+                if auto_zero:
+                    self._capture_boot_offsets()
             except Exception:
-                pass
-        for i, (name, _mid) in enumerate(self._right_motors):
-            if self._right_bus is None:
-                continue
-            try:
-                out[6 + i] = float(self._right_bus.read(name, self._ParameterType.MECHANICAL_POSITION))
-            except Exception:
-                pass
-        return out
-
-    def sync_ramped_from_feedback(self) -> None:
-        """Seed commanded-ramp state from encoders so the first ``command_a12`` starts at true pose."""
-        q = self.read_qpos12()
-        for idx in range(12):
-            if idx < 6:
-                motor_name, _ = self._left_motors[idx]
-            else:
-                motor_name, _ = self._right_motors[idx - 6]
-            self._ramped[motor_name] = float(q[idx])
-
-    def command_a12(self, target12: np.ndarray) -> None:
-        if self._dry_run or (self._left_bus is None and self._right_bus is None):
-            return
-        dt = self._dt
-        t = np.asarray(target12, dtype=np.float32).reshape(-1)
-        if t.size < 12:
-            t = np.pad(t, (0, 12 - t.size))
-        now = time.monotonic()
-        if not hasattr(self, "_last_cmd_t"):
-            self._last_cmd_t = now
-        ramp_dt = max(1e-4, min(now - self._last_cmd_t, dt.ROBSTRIDE_RAMP_DT_MAX_S))
-        self._last_cmd_t = now
-        max_speed = (
-            dt.ROBSTRIDE_RAMP_MAX_SPEED_RAD_S
-            if self._ramp_max_speed_rad_s is None
-            else float(self._ramp_max_speed_rad_s)
-        )
-        max_step = max_speed * ramp_dt
-
-        q_meas = self.read_qpos12()
-
-        for idx in range(12):
-            if idx < 6:
-                motor_name, mid = self._left_motors[idx]
-                bus = self._left_bus
-            else:
-                motor_name, mid = self._right_motors[idx - 6]
-                bus = self._right_bus
-            if bus is None:
-                continue
-            desired = float(t[idx])
-            if self._ramp_from_feedback:
-                prev = float(q_meas[idx])
-            else:
-                prev = self._ramped.get(motor_name, float(q_meas[idx]))
-            cmd = dt.ramp_toward(prev, desired, max_step)
-            self._ramped[motor_name] = cmd
-            try:
-                bus.write_operation_frame(
-                    motor_name,
-                    cmd,
-                    dt.MOTOR_KP[mid],
-                    dt.MOTOR_KD[mid],
-                    0.0,
-                    0.0,
-                )
-            except Exception:
-                pass
-
-    def close(self) -> None:
-        dt = self._dt
-        for bus, motors in [(self._left_bus, self._left_motors), (self._right_bus, self._right_motors)]:
-            if bus and motors:
+                # Make sure we release CAN buses if anything blew up mid-init
                 try:
-                    for motor_name, _ in motors:
-                        bus.write_operation_frame(motor_name, 0.0, 0.0, 0.0, 0.0, 0.0)
-                    time.sleep(0.2)
-                    for motor_name, _ in motors:
-                        bus.disable(motor_name)
-                    bus.disconnect()
+                    self._arm.disconnect(send_zero=False)
                 except Exception:
                     pass
+                self._arm = None
+                raise
+
+    # -- internal helpers -------------------------------------------------
+
+    def _capture_boot_offsets(self, *, settle_reads: int = 3) -> None:
+        """Detect one-turn encoder ambiguity and store per-joint offsets.
+
+        On power-up the RobStride multi-turn encoder can land ±2π away from the
+        true home position even when the joint is physically at zero.  We
+        compensate in software: any reading whose magnitude exceeds π is treated
+        as one wrap away.  Joints already inside (-π, +π) get a zero offset.
+        """
+        assert self._arm is not None
+        raw = np.zeros(12, dtype=np.float64)
+        for _ in range(max(1, settle_reads)):
+            raw = self._arm.read_joints12().astype(np.float64)
+        adjusted: list[tuple[int, float, float]] = []
+        for i in range(12):
+            v = float(raw[i])
+            if v > np.pi:
+                self._boot_offsets[i] = 2.0 * np.pi
+            elif v < -np.pi:
+                self._boot_offsets[i] = -2.0 * np.pi
+            else:
+                self._boot_offsets[i] = 0.0
+            if abs(self._boot_offsets[i]) > 0:
+                adjusted.append((self._motor_ids[i], v, v - self._boot_offsets[i]))
+        if adjusted:
+            print("[policy_client] Software zero: one-turn unwrap applied to:", flush=True)
+            for mid, before, after in adjusted:
+                print(
+                    f"  motor id {mid}: encoder={before:+.4f} rad → reported as {after:+.4f} rad",
+                    flush=True,
+                )
+        else:
+            print("[policy_client] Software zero: all joints already inside (-π, +π).", flush=True)
+
+    # -- public API used by main() ---------------------------------------
+
+    def read_qpos12(self) -> np.ndarray:
+        """Return the 12-DoF follower pose in the *unwrapped* (software-zero) frame."""
+        if self._arm is None:
+            return np.zeros(12, dtype=np.float32)
+        raw = self._arm.read_joints12()
+        return (raw.astype(np.float64) - self._boot_offsets).astype(np.float32)
+
+    def verify_zero_pose(
+        self,
+        *,
+        low: float = -0.2,
+        high: float = 0.2,
+        settle_reads: int = 3,
+    ) -> None:
+        """Refuse to proceed unless every follower joint is at home (~0 rad).
+
+        Mirrors the check in ``record/record_episodes_3cam.py`` but with the
+        wider ``[-0.2, +0.2] rad`` tolerance the user requested for inference.
+        Raises:
+            RuntimeError: with a per-motor breakdown if any joint is outside the
+            allowed window.
+        """
+        if self._arm is None or self._dry_run:
+            return
+        qpos = np.zeros(12, dtype=np.float32)
+        for _ in range(max(1, settle_reads)):
+            qpos = self.read_qpos12()
+        bad: list[tuple[int, float]] = []
+        for i in range(12):
+            v = float(qpos[i])
+            if not (low <= v <= high):
+                bad.append((self._motor_ids[i], v))
+        if bad:
+            details = "\n".join(
+                f"  motor id {mid} is not zero (qpos={v:+.4f} rad, allowed [{low:+.2f}, {high:+.2f}])"
+                for mid, v in bad
+            )
+            raise RuntimeError(
+                "Follower pre-inference zero-pose check failed:\n"
+                + details
+                + "\nMove the follower arm(s) back to home position (~0 rad) and re-run."
+            )
+        qpos_str = ", ".join(f"{float(v):+.4f}" for v in qpos)
+        print(f"[policy_client] Follower zero-pose check OK: qpos=[{qpos_str}]", flush=True)
+
+    def sync_ramped_from_feedback(self) -> None:
+        """Seed the ramp state from current encoders so the first command does not snap."""
+        if self._arm is None:
+            return
+        # Seed in the motor's native (encoder) frame, since command_a12 writes in that frame.
+        raw_qpos = self._arm.read_joints12()
+        self._arm.seed_ramp_from_angles(raw_qpos)
+
+    def command_a12(self, target12: np.ndarray) -> None:
+        if self._arm is None or self._dry_run:
+            return
+        t = np.asarray(target12, dtype=np.float64).reshape(-1)
+        if t.size < 12:
+            t = np.pad(t, (0, 12 - t.size))
+        if self._ramp_from_feedback:
+            # Re-seed the ramp from live encoders each tick (matches old behavior).
+            self._arm.seed_ramp_from_angles(self._arm.read_joints12())
+        encoder_target = t + self._boot_offsets
+        self._arm.command_joints12(encoder_target, ramp=True)
+
+    def close(self) -> None:
+        if self._arm is None:
+            return
+        try:
+            print(self._arm.read_stats_line(), flush=True)
+        except Exception:
+            pass
+        try:
+            self._arm.disconnect(send_zero=True)
+        except Exception:
+            pass
+        self._arm = None
 
 
 def main() -> None:
@@ -296,6 +345,24 @@ def main() -> None:
         help="Each tick, slew from measured encoder position (can oscillate if policy jitters). "
         "Default: slew from previous command (smoother), after one-time encoder sync at start.",
     )
+    p.add_argument(
+        "--no-software-zero",
+        action="store_true",
+        help="Disable the one-turn-unwrap software zero applied to RobStride encoders at start. "
+        "Use only if you have already re-zeroed the motors with vendor tools.",
+    )
+    p.add_argument(
+        "--zero-check-low",
+        type=float,
+        default=-0.2,
+        help="Lower bound (rad) for the pre-inference follower zero-pose check. Default: -0.2",
+    )
+    p.add_argument(
+        "--zero-check-high",
+        type=float,
+        default=0.2,
+        help="Upper bound (rad) for the pre-inference follower zero-pose check. Default: +0.2",
+    )
     args = p.parse_args()
 
     image_shape = (args.image_height, args.image_width)
@@ -324,11 +391,21 @@ def main() -> None:
             image_shape=image_shape,
         )
         ramp_cap = None if args.policy_ramp_max_speed == 0 else args.policy_ramp_max_speed
-        driver = PolicyRobstrideDriver(
-            dry_run=args.dry_run_robstride,
-            ramp_max_speed_rad_s=ramp_cap,
-            ramp_from_feedback=args.ramp_from_feedback,
-        )
+        try:
+            driver = PolicyRobstrideDriver(
+                dry_run=args.dry_run_robstride,
+                ramp_max_speed_rad_s=ramp_cap,
+                ramp_from_feedback=args.ramp_from_feedback,
+                auto_zero=not args.no_software_zero,
+            )
+        except Exception as exc:
+            print(f"\nERROR: failed to initialize RobStride driver: {exc}", file=sys.stderr, flush=True)
+            if hasattr(robot, "close"):
+                try:
+                    robot.close()
+                except Exception:
+                    pass
+            sys.exit(1)
 
     client = PolicyClient(
         host=args.host,
@@ -341,6 +418,24 @@ def main() -> None:
         print(f"ERROR: server not reachable at tcp://{args.host}:{args.port}", file=sys.stderr)
         sys.exit(1)
     print(f"Connected to GR00T server tcp://{args.host}:{args.port}")
+
+    # Pre-inference safety: refuse to run unless the follower is at home pose.
+    # Always run when motors are physically connected; --apply-actions only gates writes.
+    if driver is not None and args.robot == "robstride" and not args.dry_run_robstride:
+        try:
+            driver.verify_zero_pose(low=args.zero_check_low, high=args.zero_check_high)
+        except RuntimeError as exc:
+            print(f"\nERROR: {exc}", file=sys.stderr, flush=True)
+            try:
+                driver.close()
+            finally:
+                if hasattr(robot, "close"):
+                    try:
+                        robot.close()
+                    except Exception:
+                        pass
+            sys.exit(1)
+
     if driver is not None and args.robot == "robstride" and args.apply_actions and not args.dry_run_robstride:
         driver.sync_ramped_from_feedback()
         print(

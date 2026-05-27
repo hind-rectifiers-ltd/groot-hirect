@@ -334,6 +334,26 @@ class ActuatorController:
 
         return sent
 
+    def seed_ramp_from_angles(self, angles12: np.ndarray | list | tuple) -> None:
+        """
+        Pre-load the internal ramp state with the given joint angles.
+
+        After calling this, the next ``command_joints12`` will ramp *from* these
+        angles toward the requested target instead of snapping straight to it.
+        Typical use: read current encoder positions and call this before the
+        first command of an inference / playback loop so the arm does not jerk
+        from a stale (or zero) ramp seed.
+
+        Args:
+            angles12: 12-vector of seed angles, ordered like ``command_joints12``.
+        """
+        q = _pad12(angles12)
+        for i, (name, _mid) in enumerate(self._left_motors):
+            self._ramped[name] = float(q[i])
+        for i, (name, _mid) in enumerate(self._right_motors):
+            self._ramped[name] = float(q[6 + i])
+        self._last_cmd_t = None
+
     # ------------------------------------------------------------------
     # Convenience: read current mechanical positions
     # ------------------------------------------------------------------

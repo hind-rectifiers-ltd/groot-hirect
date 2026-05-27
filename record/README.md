@@ -249,9 +249,9 @@ uv run python record/policy_client_3cam.py \
   --port 5555 \
   --task "pick up the object and place it in the tray" \
   --robot robstride \
-  --video-cam-head 8 \
-  --video-cam-left-wrist 4 \
-  --video-cam-right-wrist 0 \
+  --video-cam-head 4 \
+  --video-cam-left-wrist 0 \
+  --video-cam-right-wrist 8 \
   --apply-actions
 ```
 
