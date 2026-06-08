@@ -29,6 +29,97 @@ import numpy as np
 
 CAMERA_NAMES = ("cam_head", "cam_left_wrist", "cam_right_wrist")
 
+
+def _normalize_qpos_to_pi(qpos: np.ndarray) -> np.ndarray:
+    """
+    Wrap joint angles to [-pi, pi) for dataset storage.
+
+    This is a final safety-net for wrapped encoder values (~2*pi at physical zero).
+    Commanding still uses the motor-native frame elsewhere.
+    """
+    q = np.asarray(qpos, dtype=np.float64)
+    return ((q + np.pi) % (2.0 * np.pi)) - np.pi
+
+
+class QposReadSanitizer:
+    """
+    Hold last-good qpos when a CAN read is clearly invalid.
+
+    Catches:
+      - failed reads that become 0.0 (move_actuators fallback)
+      - single-frame garbage/jump values far from the previous good sample
+    """
+
+    def __init__(
+        self,
+        *,
+        zero_epsilon: float = 0.05,
+        last_good_min_rad: float = 0.12,
+        max_step_rad: float = 0.45,
+        max_hold_ticks: int = 12,
+    ):
+        self._zero_epsilon = float(zero_epsilon)
+        self._last_good_min_rad = float(last_good_min_rad)
+        self._max_step_rad = float(max(0.0, max_step_rad))
+        self._max_hold_ticks = int(max(1, max_hold_ticks))
+        self._last_good: np.ndarray | None = None
+        self._hold_streak = np.zeros(12, dtype=np.int32)
+        self._hold_events = 0
+
+    @staticmethod
+    def max_step_for_rate(control_rate_hz: float, *, ramp_speed_rad_s: float = 6.0) -> float:
+        """Per-tick jump limit from teleop rate and ramp speed (with margin)."""
+        hz = max(control_rate_hz, 1e-3)
+        return max(0.3, (float(ramp_speed_rad_s) / hz) * 1.25)
+
+    def reset(self, qpos12: np.ndarray) -> None:
+        q = np.asarray(qpos12, dtype=np.float64).reshape(-1)
+        if q.size < 12:
+            q = np.pad(q, (0, 12 - q.size))
+        self._last_good = q[:12].copy()
+        self._hold_streak[:] = 0
+
+    @property
+    def hold_events(self) -> int:
+        return int(self._hold_events)
+
+    def apply(self, qpos12: np.ndarray) -> np.ndarray:
+        q = np.asarray(qpos12, dtype=np.float64).reshape(-1)
+        if q.size < 12:
+            q = np.pad(q, (0, 12 - q.size))
+        q = q[:12].copy()
+        if self._last_good is None:
+            self.reset(q)
+            return q
+
+        out = q.copy()
+        for i in range(12):
+            v = float(q[i])
+            prev = float(self._last_good[i])
+            if self._looks_like_bad_sample(v, prev):
+                if self._hold_streak[i] < self._max_hold_ticks:
+                    out[i] = prev
+                    self._hold_streak[i] += 1
+                    self._hold_events += 1
+                    continue
+            self._hold_streak[i] = 0
+            self._last_good[i] = v
+        return out
+
+    @staticmethod
+    def _shortest_delta_rad(value: float, last_good: float) -> float:
+        d = float(value) - float(last_good)
+        return (d + np.pi) % (2.0 * np.pi) - np.pi
+
+    def _looks_like_bad_sample(self, value: float, last_good: float) -> bool:
+        if abs(value) <= self._zero_epsilon and abs(last_good) > self._last_good_min_rad:
+            return True
+        if self._max_step_rad > 0.0:
+            if abs(self._shortest_delta_rad(value, last_good)) > self._max_step_rad:
+                return True
+        return False
+
+
 def test_cameras(max_index: int, image_shape: tuple[int, int], warmup: int = 12, black_threshold: float = 5.0) -> None:
     """Probe video indices and report which return non-black frames."""
     try:
@@ -263,6 +354,16 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
         self._dry_run = bool(dry_run)
         self._left_motors_meta = [(f"motor_{mid}", mid) for mid in dt.LEFT_ROBSTRIDE_IDS]
         self._right_motors_meta = [(f"motor_{mid}", mid) for mid in dt.RIGHT_ROBSTRIDE_IDS]
+        self._motor_ids: list[int] = list(dt.LEFT_ROBSTRIDE_IDS) + list(dt.RIGHT_ROBSTRIDE_IDS)
+        # One-turn unwrap offsets in encoder frame. Reported qpos is (raw - offsets).
+        self._boot_offsets = np.zeros(12, dtype=np.float64)
+        self._control_rate_hz = float(control_rate)
+        self._qpos_sanitizer = QposReadSanitizer(
+            max_step_rad=QposReadSanitizer.max_step_for_rate(
+                self._control_rate_hz,
+                ramp_speed_rad_s=dt.ROBSTRIDE_RAMP_MAX_SPEED_RAD_S,
+            ),
+        )
 
         self._arm: ActuatorController | None = None
         if not self._dry_run:
@@ -272,6 +373,7 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
                 ramp_dt_max_s=dt.ROBSTRIDE_RAMP_DT_MAX_S,
             )
             self._arm.connect()
+            self._capture_boot_offsets()
             # Pre-flight: refuse to record unless the follower is already at home.
             # Ensures the recorded trajectory starts from a known zero pose so we
             # do not save ramp-from-arbitrary-pose noise as the first frames.
@@ -293,11 +395,56 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
         )
         self._thread.start()
 
+    def _capture_boot_offsets(self, *, settle_reads: int = 3) -> None:
+        """Apply one-turn software unwrap so home near 0 is represented near 0."""
+        assert self._arm is not None, "ActuatorController must be connected"
+        raw = np.zeros(12, dtype=np.float64)
+        for _ in range(max(1, settle_reads)):
+            raw = self._arm.read_joints12().astype(np.float64)
+        adjusted: list[tuple[int, float, float]] = []
+        for i, mid in enumerate(self._motor_ids):
+            v = float(raw[i])
+            if v > np.pi:
+                self._boot_offsets[i] = 2.0 * np.pi
+            elif v < -np.pi:
+                self._boot_offsets[i] = -2.0 * np.pi
+            else:
+                self._boot_offsets[i] = 0.0
+            if self._boot_offsets[i] != 0.0:
+                adjusted.append((mid, v, v - self._boot_offsets[i]))
+        if adjusted:
+            print("[record] Software zero: one-turn unwrap applied to:", flush=True)
+            for mid, before, after in adjusted:
+                print(f"  motor id {mid}: encoder={before:+.4f} rad -> reported as {after:+.4f} rad", flush=True)
+        else:
+            print("[record] Software zero: all joints already inside (-pi, +pi).", flush=True)
+
+    def _read_qpos12_raw(self, *, samples: int = 3, sample_gap_s: float = 0.003) -> np.ndarray:
+        """
+        Read follower pose in unwrapped software-zero frame (no dropout filtering).
+
+        Takes the per-joint median of ``samples`` reads to reject single garbage frames.
+        """
+        assert self._arm is not None
+        n = max(1, int(samples))
+        stack = []
+        for s in range(n):
+            raw = self._arm.read_joints12().astype(np.float64)
+            stack.append(raw - self._boot_offsets)
+            if s + 1 < n and sample_gap_s > 0.0:
+                time.sleep(sample_gap_s)
+        return np.median(np.stack(stack, axis=0), axis=0)
+
+    def _read_qpos12(self) -> np.ndarray:
+        """Read qpos with median filtering and last-good hold for bad samples."""
+        q = self._qpos_sanitizer.apply(self._read_qpos12_raw())
+        return _normalize_qpos_to_pi(q)
+
     def _verify_zero_pose(
         self,
         *,
-        low: float = -0.1,
-        high: float = 0.1,
+        low: float = -0.2,
+        high: float = 0.2,
         settle_reads: int = 3,
     ) -> None:
         """
@@ -313,11 +460,10 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
         assert self._arm is not None, "ActuatorController must be connected"
         qpos = np.zeros(12, dtype=np.float64)
         for _ in range(max(1, settle_reads)):
-            qpos = self._arm.read_joints12()
+            qpos = self._read_qpos12_raw()
 
-        motor_ids = list(self._dt.LEFT_ROBSTRIDE_IDS) + list(self._dt.RIGHT_ROBSTRIDE_IDS)
         out_of_range: list[tuple[int, float]] = []
-        for i, mid in enumerate(motor_ids):
+        for i, mid in enumerate(self._motor_ids):
             v = float(qpos[i])
             if not (low <= v <= high):
                 out_of_range.append((mid, v))
@@ -333,6 +479,7 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
                 + "\nMove the follower arm(s) back to home position (~0 rad) and re-run."
             )
 
+        self._qpos_sanitizer.reset(qpos)
         qpos_str = ", ".join(f"{float(v):+.4f}" for v in qpos)
         print(f"[record] Follower zero-pose check OK: qpos=[{qpos_str}]", flush=True)
 
@@ -371,13 +518,16 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
 
             if not teleop_initialized:
                 if self._arm is not None:
+                    # Keep control references in the motor's native encoder frame.
+                    # Software-unwrapped qpos is for safety checks / logging only.
                     robstride_ref = self._arm.read_joints12().astype(np.float64)
                 prev_servo = list(a12)
                 teleop_initialized = True
                 # Seed published state with the initial follower pose.
                 with self._lock:
-                    self._qpos12[:] = robstride_ref.astype(np.float32)
-                    self._action12[:] = robstride_ref.astype(np.float32)
+                    q0 = self._read_qpos12()
+                    self._qpos12[:] = q0.astype(np.float32)
+                    self._action12[:] = q0.astype(np.float32)
                 continue
 
             # Accumulate leader-side servo deltas (in raw servo units).
@@ -396,19 +546,19 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
                 d_rad = dt.accum_units_to_target_delta_rad(accum[servo_idx], motor_id, servo_idx)
                 targets[6 + i] = robstride_ref[6 + i] + d_rad
 
-            # Command + read via ActuatorController:
-            #   - command_joints12 ramps internally and returns the ramped targets (= action).
-            #   - read_joints12 drains stale OPERATION_STATUS frames and retries per motor.
+            # Read qpos *before* commanding so MIT status frames do not corrupt the read.
             if self._arm is not None:
+                qpos = self._read_qpos12()
                 sent = self._arm.command_joints12(targets, ramp=True)
-                qpos = self._arm.read_joints12()
+                action = _normalize_qpos_to_pi(sent.astype(np.float64) - self._boot_offsets)
             else:
                 sent = targets
                 qpos = np.zeros(12, dtype=np.float64)
+                action = qpos
 
             with self._lock:
-                self._action12[:] = sent.astype(np.float32)
                 self._qpos12[:] = qpos.astype(np.float32)
+                self._action12[:] = action.astype(np.float32)
 
             elapsed = time.monotonic() - t0
             sleep_s = period - elapsed
@@ -436,6 +586,12 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
                 print(self._arm.read_stats_line(), flush=True)
             except Exception:
                 pass
+            if self._qpos_sanitizer.hold_events > 0:
+                print(
+                    f"[record] qpos dropout holds applied: {self._qpos_sanitizer.hold_events} "
+                    "(failed CAN reads replaced with last-good values)",
+                    flush=True,
+                )
             try:
                 self._arm.disconnect(send_zero=True)
             except Exception:
@@ -597,7 +753,9 @@ def record_episode(
         img_grp = obs_grp.create_group("images")
         for cam in CAMERA_NAMES:
             img_grp.create_dataset(cam, data=np.asarray(imgs[cam], dtype=np.uint8), compression="gzip")
-        obs_grp.create_dataset("qpos", data=np.asarray(obs_qpos, dtype=np.float32))
+        qpos_arr = np.asarray(obs_qpos, dtype=np.float32)
+        qpos_arr = _normalize_qpos_to_pi(qpos_arr).astype(np.float32)
+        obs_grp.create_dataset("qpos", data=qpos_arr)
         root.create_dataset("action", data=np.asarray(act, dtype=np.float32))
         if include_qvel and obs_qvel:
             obs_grp.create_dataset("qvel", data=np.asarray(obs_qvel, dtype=np.float32))

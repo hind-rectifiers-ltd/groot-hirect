@@ -56,7 +56,7 @@ MOTOR_MODEL_MAP: dict[int, str] = {
     9: "rs-02", 10: "rs-02", 11: "rs-02", 12: "rs-02",
 }
 MOTOR_KP: dict[int, float] = {
-    1: 180.0, 2: 180.0, 3: 180.0, 4: 180.0, 5: 100.0, 6: 180.0,
+    1: 180.0, 2: 180.0, 3: 180.0, 4: 180.0, 5: 100.0, 6: 100.0,
     7: 180.0, 8: 180.0, 9: 30.0,  10: 30.0, 11: 30.0, 12: 30.0,
 }
 MOTOR_KD: dict[int, float] = {
@@ -71,7 +71,18 @@ MOTOR_TORQUE_LIMIT: dict[int, float] = {
 RAMP_MAX_SPEED_RAD_S = 6.0   # rad/s slew limit (per joint, per second)
 RAMP_DT_MAX_S = 0.1          # cap on dt used for ramp step calculation
 
+# Command safety: compare targets to live encoder reads in the motor's native frame.
+# Uses per-step delta limits (not abs(angle) > pi) so wrapped encoders near 2*pi do not false-trip.
+SAFETY_MAX_DELTA_RAD = 0.75          # max |target - encoder| per command tick
+SAFETY_MAX_INITIAL_DELTA_RAD = 0.5   # stricter limit on the first command after connect
+SAFETY_EXCLUDED_MOTOR_IDS: tuple[int, ...] = (11, 12)  # grippers
+
 NUM_JOINTS = 12
+JOINT_MOTOR_IDS: list[int] = LEFT_ROBSTRIDE_IDS + RIGHT_ROBSTRIDE_IDS
+
+
+class SafetyLimitBreachError(RuntimeError):
+    """Command rejected because a joint target jumped too far from the current encoder reading."""
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -175,16 +186,32 @@ class ActuatorController:
         ramp: bool = True,
         ramp_max_speed_rad_s: float = RAMP_MAX_SPEED_RAD_S,
         ramp_dt_max_s: float = RAMP_DT_MAX_S,
+        safety_enabled: bool = True,
+        safety_max_delta_rad: float = SAFETY_MAX_DELTA_RAD,
+        safety_max_initial_delta_rad: float = SAFETY_MAX_INITIAL_DELTA_RAD,
+        safety_excluded_motor_ids: tuple[int, ...] = SAFETY_EXCLUDED_MOTOR_IDS,
+        safety_abort_on_breach: bool = True,
     ):
         """
         Args:
             ramp: Slew-limit each joint toward the target (recommended; prevents jerks).
             ramp_max_speed_rad_s: Maximum joint speed allowed by the ramp (rad/s).
             ramp_dt_max_s: dt is capped at this value when computing ramp step.
+            safety_enabled: Reject commands whose targets jump too far from encoder feedback.
+            safety_max_delta_rad: Per-tick |target - encoder| limit (rad, native encoder frame).
+            safety_max_initial_delta_rad: Limit for the first command after :meth:`connect`.
+            safety_excluded_motor_ids: Motor IDs skipped by safety delta checks.
+            safety_abort_on_breach: If True, disable torque and disconnect on breach.
         """
         self._ramp = bool(ramp)
         self._ramp_max_speed = float(ramp_max_speed_rad_s)
         self._ramp_dt_max = float(ramp_dt_max_s)
+        self._safety_enabled = bool(safety_enabled)
+        self._safety_max_delta_rad = float(max(0.0, safety_max_delta_rad))
+        self._safety_max_initial_delta_rad = float(max(0.0, safety_max_initial_delta_rad))
+        self._safety_excluded_motor_ids = {int(mid) for mid in safety_excluded_motor_ids}
+        self._safety_abort_on_breach = bool(safety_abort_on_breach)
+        self._safety_command_count = 0
 
         self._left_bus = None
         self._right_bus = None
@@ -223,6 +250,7 @@ class ActuatorController:
             )
         self._ramped.clear()
         self._last_cmd_t = time.monotonic()
+        self._safety_command_count = 0
         self._connected = True
 
     def disconnect(self, *, send_zero: bool = True) -> None:
@@ -251,7 +279,70 @@ class ActuatorController:
         self._left_motors = []
         self._right_motors = []
         self._ramped.clear()
+        self._safety_command_count = 0
         self._connected = False
+
+    def _joint_bus_live(self, joint_index: int) -> bool:
+        if joint_index < 6:
+            return self._left_bus is not None and len(self._left_motors) > 0
+        return self._right_bus is not None and len(self._right_motors) > 0
+
+    def _enforce_command_safety(self, desired12: np.ndarray) -> None:
+        """
+        Abort if any commanded target is too far from the live encoder (raw frame).
+
+        This catches frame mistakes (e.g. sending ~0 rad to a joint reporting ~6.2 rad)
+        without rejecting valid wrapped readings via a naive abs(angle) > pi check.
+        """
+        if not self._safety_enabled:
+            self._safety_command_count += 1
+            return
+
+        limit = (
+            self._safety_max_initial_delta_rad
+            if self._safety_command_count == 0
+            else self._safety_max_delta_rad
+        )
+        self._safety_command_count += 1
+
+        if limit <= 0.0:
+            return
+
+        current = self.read_joints12()
+        breaches: list[tuple[int, float, float, float]] = []
+        for i in range(NUM_JOINTS):
+            if not self._joint_bus_live(i):
+                continue
+            mid = JOINT_MOTOR_IDS[i]
+            if mid in self._safety_excluded_motor_ids:
+                continue
+            enc = float(current[i])
+            tgt = float(desired12[i])
+            delta = abs(tgt - enc)
+            if delta > limit:
+                breaches.append((mid, enc, tgt, delta))
+
+        if not breaches:
+            return
+
+        which = "first command after connect" if self._safety_command_count == 1 else "command tick"
+        details = "\n".join(
+            f"  motor id {mid}: encoder={enc:+.4f} rad  target={tgt:+.4f} rad  "
+            f"|delta|={delta:+.4f} rad  (limit {limit:.4f})"
+            for mid, enc, tgt, delta in breaches
+        )
+        msg = (
+            "Safety limits breached: joint target jump too large in encoder frame "
+            f"({which}).\n"
+            + details
+            + "\nRefusing to command motors. Check frame/unwrapping and homing."
+        )
+        if self._safety_abort_on_breach:
+            try:
+                self.disconnect(send_zero=True)
+            except Exception as exc:
+                print(f"[move_actuators] safety disconnect warning: {exc}", flush=True)
+        raise SafetyLimitBreachError(msg)
 
     @property
     def connected(self) -> bool:
@@ -287,6 +378,7 @@ class ActuatorController:
 
         Raises:
             RuntimeError: if not connected.
+            SafetyLimitBreachError: if a target is too far from the current encoder reading.
         """
         if not self._connected:
             raise RuntimeError(
@@ -294,6 +386,7 @@ class ActuatorController:
             )
 
         q = _pad12(angles12)
+        self._enforce_command_safety(q)
         use_ramp = self._ramp if ramp is None else bool(ramp)
 
         # Compute ramp step from elapsed time

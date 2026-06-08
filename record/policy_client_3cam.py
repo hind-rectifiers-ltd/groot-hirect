@@ -27,12 +27,14 @@ RobStride follower command (same CAN layout as direct_teleop / record direct_tel
     --task "..." --apply-actions --dry-run-robstride  # omit dry-run on real hardware
 
 Control notes:
-  - By default, targets are slewed from the **previous commanded** joint set (teleop-style). That
-    smooths policy jitter and avoids wrist oscillation from encoder noise / delay. Before the loop,
-    we **seed** that state from real encoders so the first step does not snap from garbage.
-  - Use ``--ramp-from-feedback`` to slew from measured ``qpos`` every tick instead (can hunt if
-    the policy target changes every step).
-  - Use ``--policy-ramp-max-speed`` (rad/s) to limit approach speed; default 2.5 is below teleop's 6.
+  - Default ``--control-mode chunk`` runs the full 16-step action horizon before re-inferring (much
+    smoother than querying the policy every tick with ``--action-time-index 0`` only).
+  - ``--action-smoothing-alpha`` / ``--gripper-smoothing-alpha`` low-pass filter policy targets;
+    grippers default to heavier smoothing so jaws can close without jerking open.
+  - Targets are slewed from the **previous commanded** joint set (teleop-style). Before the loop,
+    ramp state is **seeded** from encoders so the first command does not snap.
+  - Use ``--policy-ramp-max-speed`` (rad/s) for MIT slew; ``--max-target-step-gripper`` caps how
+    fast the *filtered* gripper target can change per control tick.
   - Match ``--task`` to training text (see dataset ``meta/tasks.jsonl``).
 """
 
@@ -59,6 +61,36 @@ VIDEO_KEYS = ("head", "left_wrist", "right_wrist")
 CAM_TO_VIDEO = dict(zip(CAMERA_NAMES, VIDEO_KEYS, strict=True))
 
 LANGUAGE_KEY = "annotation.human.task_description"
+
+# Joint layout: L arm 0-4, L gripper 5, R arm 6-10, R gripper 11 (motor ids 11/12).
+GRIPPER_JOINT_INDICES = (5, 11)
+ACTION_KEYS = ("left_arm", "left_gripper", "right_arm", "right_gripper")
+DEFAULT_ACTION_HORIZON = 16
+JOINT_LABELS_12 = ("L0", "L1", "L2", "L3", "L4", "Lg", "R0", "R1", "R2", "R3", "R4", "Rg")
+
+
+def format_joint_vector12(vec: np.ndarray, *, precision: int = 4) -> str:
+    """Compact labeled 12-DoF line for logging."""
+    v = np.asarray(vec, dtype=np.float64).reshape(-1)
+    if v.size < 12:
+        v = np.pad(v, (0, 12 - v.size))
+    parts = [f"{JOINT_LABELS_12[i]}={float(v[i]):+.{precision}f}" for i in range(12)]
+    return "  ".join(parts)
+
+
+def log_step_state(
+    *,
+    step: int,
+    qpos: np.ndarray,
+    cmd: np.ndarray,
+    precision: int = 4,
+    extra: str = "",
+) -> None:
+    """Print full qpos and cmd for all 12 joints."""
+    suffix = f"  {extra}" if extra else ""
+    print(f"step {step}{suffix}", flush=True)
+    print(f"  qpos  {format_joint_vector12(qpos, precision=precision)}", flush=True)
+    print(f"  cmd   {format_joint_vector12(cmd, precision=precision)}", flush=True)
 
 
 def qpos12_to_state_dict(qpos12: np.ndarray) -> dict[str, np.ndarray]:
@@ -107,15 +139,113 @@ def actions_to_vector12(action: dict[str, np.ndarray], time_index: int = 0) -> n
 
     Each value is (B, T, D); we take batch 0, timestep ``time_index``.
     """
+    chunk = actions_to_chunk12(action)
+    if time_index < 0 or time_index >= chunk.shape[0]:
+        raise IndexError(f"action time_index {time_index} out of range for horizon {chunk.shape[0]}")
+    return chunk[time_index].astype(np.float32)
+
+
+def actions_to_chunk12(action: dict[str, np.ndarray]) -> np.ndarray:
+    """Decode policy output to (T, 12) absolute joint targets."""
     parts = []
-    for key in ("left_arm", "left_gripper", "right_arm", "right_gripper"):
+    horizon: int | None = None
+    for key in ACTION_KEYS:
         if key not in action:
             raise KeyError(f"Missing action key {key!r}; got {list(action.keys())}")
         arr = np.asarray(action[key], dtype=np.float32)
         if arr.ndim != 3:
             raise ValueError(f"action[{key!r}] expected (B,T,D), got {arr.shape}")
-        parts.append(arr[0, time_index].reshape(-1))
-    return np.concatenate(parts, axis=0).astype(np.float32)
+        slab = arr[0]
+        if horizon is None:
+            horizon = int(slab.shape[0])
+        elif int(slab.shape[0]) != horizon:
+            raise ValueError(f"action horizon mismatch for {key!r}: {slab.shape[0]} vs {horizon}")
+        parts.append(slab.reshape(horizon, -1))
+    return np.concatenate(parts, axis=-1).astype(np.float32)
+
+
+def upsample_chunk_linear(chunk: np.ndarray, factor: int) -> np.ndarray:
+    """Linearly upsample (T, 12) chunk to (T*factor, 12) for finer control ticks."""
+    if factor <= 1:
+        return np.asarray(chunk, dtype=np.float32)
+    c = np.asarray(chunk, dtype=np.float64)
+    if c.shape[0] < 2:
+        return np.repeat(c, factor, axis=0).astype(np.float32)
+    t_old = np.arange(c.shape[0], dtype=np.float64)
+    t_new = np.linspace(0.0, float(c.shape[0] - 1), (c.shape[0] - 1) * factor + 1)
+    out = np.zeros((t_new.size, c.shape[1]), dtype=np.float64)
+    for j in range(c.shape[1]):
+        out[:, j] = np.interp(t_new, t_old, c[:, j])
+    return out.astype(np.float32)
+
+
+class ActionTargetSmoother:
+    """Exponential smoothing on policy targets; grippers can use a separate (stronger) alpha."""
+
+    def __init__(
+        self,
+        *,
+        arm_alpha: float = 0.4,
+        gripper_alpha: float = 0.65,
+        max_arm_step: float = 0.0,
+        max_gripper_step: float = 0.025,
+    ):
+        self._arm_alpha = float(np.clip(arm_alpha, 0.0, 1.0))
+        self._gripper_alpha = float(np.clip(gripper_alpha, 0.0, 1.0))
+        self._max_arm_step = float(max(0.0, max_arm_step))
+        self._max_gripper_step = float(max(0.0, max_gripper_step))
+        self._state: np.ndarray | None = None
+
+    @property
+    def last_output(self) -> np.ndarray | None:
+        if self._state is None:
+            return None
+        return self._state.astype(np.float32)
+
+    def reset(self, qpos12: np.ndarray) -> None:
+        self._state = np.asarray(qpos12, dtype=np.float64).reshape(-1).copy()
+        if self._state.size < 12:
+            self._state = np.pad(self._state, (0, 12 - self._state.size))
+
+    @property
+    def enabled(self) -> bool:
+        return self._arm_alpha > 0.0 or self._gripper_alpha > 0.0
+
+    def apply(self, target12: np.ndarray) -> np.ndarray:
+        t = np.asarray(target12, dtype=np.float64).reshape(-1)
+        if t.size < 12:
+            t = np.pad(t, (0, 12 - t.size))
+        if self._state is None:
+            self.reset(t)
+            return t.astype(np.float32)
+        out = self._state.copy()
+        for i in range(12):
+            alpha = self._gripper_alpha if i in GRIPPER_JOINT_INDICES else self._arm_alpha
+            if alpha <= 0.0:
+                out[i] = float(t[i])
+            else:
+                out[i] = alpha * out[i] + (1.0 - alpha) * float(t[i])
+            max_step = self._max_gripper_step if i in GRIPPER_JOINT_INDICES else self._max_arm_step
+            if max_step > 0.0:
+                delta = float(np.clip(out[i] - self._state[i], -max_step, max_step))
+                out[i] = self._state[i] + delta
+        self._state = out
+        return out.astype(np.float32)
+
+
+def blend_chunk_start(chunk: np.ndarray, from_pose: np.ndarray, blend_steps: int) -> np.ndarray:
+    """Ease the first ``blend_steps`` rows from ``from_pose`` into the chunk (reduces replan jumps)."""
+    if blend_steps <= 0:
+        return chunk
+    c = np.asarray(chunk, dtype=np.float64).copy()
+    start = np.asarray(from_pose, dtype=np.float64).reshape(-1)
+    if start.size < 12:
+        start = np.pad(start, (0, 12 - start.size))
+    n = min(blend_steps, c.shape[0])
+    for i in range(n):
+        w = (i + 1) / float(n)
+        c[i] = (1.0 - w) * start + w * c[i]
+    return c.astype(np.float32)
 
 
 # --- Robot backends (aligned with record_episodes_3cam) ---
@@ -321,9 +451,81 @@ def main() -> None:
     p.add_argument("--port", type=int, default=5555)
     p.add_argument("--timeout-ms", type=int, default=120000)
     p.add_argument("--task", type=str, default="perform the manipulation task")
-    p.add_argument("--rate-hz", type=float, default=5.0)
+    p.add_argument(
+        "--rate-hz",
+        type=float,
+        default=10.0,
+        help="Control loop rate (Hz). Match training teleop (--teleop-rate 10) for chunk mode.",
+    )
     p.add_argument("--max-steps", type=int, default=10**9)
-    p.add_argument("--action-time-index", type=int, default=0, help="Which horizon slot to execute (0..15)")
+    p.add_argument(
+        "--control-mode",
+        choices=("chunk", "legacy"),
+        default="chunk",
+        help="chunk: execute full policy horizon before re-inferring (recommended). "
+        "legacy: one policy query per tick using --action-time-index only.",
+    )
+    p.add_argument(
+        "--infer-stride",
+        type=int,
+        default=0,
+        help="In chunk mode, re-infer after this many executed steps (0 = full horizon). "
+        "Use 8-12 for more reactive control at the cost of some smoothness.",
+    )
+    p.add_argument(
+        "--chunk-upsample",
+        type=int,
+        default=1,
+        help="Linearly upsample each action chunk by this factor before execution (finer motion).",
+    )
+    p.add_argument(
+        "--chunk-blend-steps",
+        type=int,
+        default=4,
+        help="When a new chunk arrives, blend its first N steps from the last smoothed command.",
+    )
+    p.add_argument(
+        "--action-smoothing-alpha",
+        type=float,
+        default=0.4,
+        help="EMA on arm joints: y = alpha*prev + (1-alpha)*target. 0 disables arm smoothing.",
+    )
+    p.add_argument(
+        "--gripper-smoothing-alpha",
+        type=float,
+        default=0.7,
+        help="EMA on gripper joints (indices 5, 11). Higher = smoother/slower jaw motion.",
+    )
+    p.add_argument(
+        "--max-target-step-gripper",
+        type=float,
+        default=0.025,
+        help="Max change (rad) of smoothed gripper target per control tick. 0 = no cap.",
+    )
+    p.add_argument(
+        "--max-target-step-arm",
+        type=float,
+        default=0.0,
+        help="Max change (rad) of smoothed arm target per control tick. 0 = no cap (ramp only).",
+    )
+    p.add_argument("--action-time-index", type=int, default=0, help="legacy mode: horizon slot (0..15)")
+    p.add_argument(
+        "--log-every",
+        type=int,
+        default=1,
+        help="Print full 12-joint qpos/cmd every N control steps (1 = every step).",
+    )
+    p.add_argument(
+        "--log-joint-precision",
+        type=int,
+        default=4,
+        help="Decimal places for per-joint qpos/cmd log lines.",
+    )
+    p.add_argument(
+        "--compact-log",
+        action="store_true",
+        help="Legacy one-line logs (first 4 joints + grippers only).",
+    )
     p.add_argument("--robot", choices=["demo", "usb_cam", "robstride"], default="demo")
     p.add_argument("--video-cam-head", type=int, default=4)
     p.add_argument("--video-cam-left-wrist", type=int, default=0)
@@ -436,37 +638,143 @@ def main() -> None:
                         pass
             sys.exit(1)
 
+    smoother: ActionTargetSmoother | None = None
+    if args.action_smoothing_alpha > 0.0 or args.gripper_smoothing_alpha > 0.0:
+        smoother = ActionTargetSmoother(
+            arm_alpha=args.action_smoothing_alpha,
+            gripper_alpha=args.gripper_smoothing_alpha,
+            max_arm_step=args.max_target_step_arm,
+            max_gripper_step=args.max_target_step_gripper,
+        )
+
     if driver is not None and args.robot == "robstride" and args.apply_actions and not args.dry_run_robstride:
         driver.sync_ramped_from_feedback()
+        q0 = driver.read_qpos12()
+        if smoother is not None:
+            smoother.reset(q0)
         print(
             "RobStride ramp: from_feedback="
             f"{args.ramp_from_feedback}  max_speed_rad_s="
             f"{args.policy_ramp_max_speed if args.policy_ramp_max_speed != 0 else 'direct_teleop default'}"
+            f"  control_mode={args.control_mode}  rate_hz={args.rate_hz}",
+            flush=True,
         )
+        if smoother is not None and smoother.enabled:
+            print(
+                f"  smoothing: arm_alpha={args.action_smoothing_alpha} "
+                f"gripper_alpha={args.gripper_smoothing_alpha} "
+                f"max_grip_step={args.max_target_step_gripper}",
+                flush=True,
+            )
 
     period = 1.0 / max(args.rate_hz, 1e-3)
     step = 0
+    chunk_queue: list[np.ndarray] = []
+    chunk_plan_id = 0
+    last_cmd = np.zeros(12, dtype=np.float32)
+
+    def fetch_observation() -> tuple[dict[str, Any], np.ndarray, dict[str, np.ndarray]]:
+        raw = robot.get_observation()
+        qpos = np.asarray(raw["qpos"], dtype=np.float32).reshape(-1)
+        if driver is not None:
+            qpos = driver.read_qpos12()
+        obs = build_gr00t_observation(raw["images"], qpos, args.task)
+        return obs, qpos, raw["images"]
+
+    def plan_chunk(obs: dict[str, Any], qpos: np.ndarray) -> np.ndarray:
+        nonlocal chunk_plan_id, last_cmd
+        action, _info = client.get_action(obs)
+        chunk = actions_to_chunk12(action)
+        if args.chunk_upsample > 1:
+            chunk = upsample_chunk_linear(chunk, args.chunk_upsample)
+        stride = args.infer_stride if args.infer_stride > 0 else chunk.shape[0]
+        stride = min(stride, chunk.shape[0])
+        chunk = chunk[:stride]
+        if args.chunk_blend_steps > 0:
+            chunk = blend_chunk_start(chunk, last_cmd, args.chunk_blend_steps)
+        chunk_plan_id += 1
+        prec = max(0, args.log_joint_precision)
+        print(
+            f"[policy_client] plan #{chunk_plan_id}  horizon={chunk.shape[0]}  "
+            f"queue will have {chunk.shape[0]} steps",
+            flush=True,
+        )
+        print(f"  qpos  {format_joint_vector12(qpos, precision=prec)}", flush=True)
+        print(f"  target[0]  {format_joint_vector12(chunk[0], precision=prec)}", flush=True)
+        return chunk
+
+    def execute_target(raw_target: np.ndarray) -> np.ndarray:
+        nonlocal last_cmd
+        cmd = smoother.apply(raw_target) if smoother is not None else np.asarray(raw_target, dtype=np.float32)
+        last_cmd = cmd.copy()
+        if args.robot == "robstride" and driver is not None and args.apply_actions:
+            driver.command_a12(cmd)
+        return cmd
+
+    def hold_last_command(reason: str, qpos: np.ndarray) -> None:
+        """Send the previous valid command when policy output is unavailable/invalid."""
+        nonlocal step
+        cmd = execute_target(last_cmd)
+        print(f"[policy_client] WARN: {reason}; holding last command.", flush=True)
+        log_step_state(
+            step=step,
+            qpos=qpos,
+            cmd=cmd,
+            precision=args.log_joint_precision,
+            extra="HOLD",
+        )
+        step += 1
+
+    def maybe_log_step(*, qpos: np.ndarray, cmd: np.ndarray, extra: str = "") -> None:
+        if args.log_every <= 0 or (step % args.log_every) != 0:
+            return
+        if args.compact_log:
+            print(
+                f"step {step}  cmd[:4]={np.array2string(cmd[:4], precision=3)}  "
+                f"qpos[:4]={np.array2string(qpos[:4], precision=3)}  "
+                f"grip={cmd[5]:.3f},{cmd[11]:.3f}  {extra}",
+                flush=True,
+            )
+        else:
+            log_step_state(
+                step=step,
+                qpos=qpos,
+                cmd=cmd,
+                precision=args.log_joint_precision,
+                extra=extra,
+            )
+
     try:
         while step < args.max_steps:
             t0 = time.monotonic()
-            raw = robot.get_observation()
-            qpos = np.asarray(raw["qpos"], dtype=np.float32).reshape(-1)
-            if driver is not None:
-                qpos = driver.read_qpos12()
 
-            obs = build_gr00t_observation(raw["images"], qpos, args.task)
-            action, info = client.get_action(obs)
-            a12 = actions_to_vector12(action, time_index=args.action_time_index)
+            if not chunk_queue:
+                obs, qpos, _images = fetch_observation()
+                if args.control_mode == "legacy":
+                    try:
+                        action, _info = client.get_action(obs)
+                        raw = actions_to_vector12(action, time_index=args.action_time_index)
+                        if not np.all(np.isfinite(raw)):
+                            raise ValueError("policy action contains non-finite values")
+                        cmd = execute_target(raw)
+                        maybe_log_step(qpos=qpos, cmd=cmd, extra="legacy")
+                        step += 1
+                    except Exception as exc:
+                        hold_last_command(f"policy read failed ({exc})", qpos)
+                else:
+                    try:
+                        chunk_queue = list(plan_chunk(obs, qpos))
+                    except Exception as exc:
+                        hold_last_command(f"policy replan failed ({exc})", qpos)
+                        chunk_queue = []
 
-            if args.robot == "robstride" and driver is not None and args.apply_actions:
-                driver.command_a12(a12)
+            if chunk_queue:
+                raw_target = chunk_queue.pop(0)
+                qpos = driver.read_qpos12() if driver is not None else np.zeros(12, dtype=np.float32)
+                cmd = execute_target(raw_target)
+                maybe_log_step(qpos=qpos, cmd=cmd, extra=f"queue={len(chunk_queue)}")
+                step += 1
 
-            print(
-                f"step {step}  a12[:4]={np.array2string(a12[:4], precision=3)}  "
-                f"qpos[:4]={np.array2string(qpos[:4], precision=3)}"
-            )
-
-            step += 1
             elapsed = time.monotonic() - t0
             time.sleep(max(0.0, period - elapsed))
     except KeyboardInterrupt:

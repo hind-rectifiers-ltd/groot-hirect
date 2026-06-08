@@ -85,13 +85,32 @@ def plot_qpos_action_on_axes(
     D = min(qpos.shape[1], action.shape[1])
     labels = _joint_labels(D)
     x = np.arange(T)
-    cmap = plt.cm.tab20(np.linspace(0, 1, max(D, 1)))
+    # Use fixed categorical tab20 colors (not interpolated samples) so
+    # joint->color mapping is stable and visually identical across subplots.
+    palette = list(plt.get_cmap("tab20").colors)
 
     ax_q.clear()
     ax_a.clear()
     for i in range(D):
-        ax_q.plot(x, qpos[:, i], color=cmap[i % 20], lw=1.0, label=labels[i] if D <= 12 else None)
-        ax_a.plot(x, action[:, i], color=cmap[i % 20], lw=1.0)
+        color = palette[i % len(palette)]
+        lbl = labels[i] if D <= 12 else None
+        ax_q.plot(x, qpos[:, i], color=color, lw=1.0, label=lbl)
+        ax_a.plot(x, action[:, i], color=color, lw=1.0, label=lbl)
+
+    # Keep identical y-scale on both axes so same-joint traces are directly comparable.
+    y_all = np.concatenate([qpos[:, :D].reshape(-1), action[:, :D].reshape(-1)], axis=0)
+    finite = np.isfinite(y_all)
+    if np.any(finite):
+        y_min = float(np.min(y_all[finite]))
+        y_max = float(np.max(y_all[finite]))
+        if y_max <= y_min:
+            pad = 0.5
+        else:
+            pad = 0.05 * (y_max - y_min)
+        y_lo = y_min - pad
+        y_hi = y_max + pad
+        ax_q.set_ylim(y_lo, y_hi)
+        ax_a.set_ylim(y_lo, y_hi)
     fi = int(np.clip(frame_i, 0, T - 1))
     ax_q.axvline(fi, color="yellow", lw=2.0, zorder=10)
     ax_a.axvline(fi, color="yellow", lw=2.0, zorder=10)
@@ -104,6 +123,8 @@ def plot_qpos_action_on_axes(
     ax_a.set_xlabel("frame index")
     ax_a.set_title("Actions (commands)")
     ax_a.grid(True, alpha=0.3)
+    if D <= 12:
+        ax_a.legend(loc="upper right", fontsize=6, ncol=4, framealpha=0.7)
 
 
 def render_trajectory_panel_bgr(

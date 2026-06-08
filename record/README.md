@@ -62,6 +62,21 @@ export CKPT="${FT_OUT}/checkpoint-10000"
 
 ## 1) Record episodes (v2 flow input)
 
+### Timing (important for GR00T)
+
+Keep **motors, camera sampling, conversion fps, and deployment rate** on the same clock:
+
+
+| Stage                                          | Flag            | Value         |
+| ---------------------------------------------- | --------------- | ------------- |
+| Follower teleop                                | `--teleop-rate` | `10`          |
+| Record loop (images + `qpos`/`action` logging) | `--dt`          | `0.1` (10 Hz) |
+| LeRobot convert                                | `--fps`         | `10`          |
+| Policy client                                  | `--rate-hz`     | `10`          |
+
+
+USB cameras may run faster internally; the recorder grabs **one frame per `--dt` tick**. Do **not** use default `--dt 1/30` (~30 Hz) with `--teleop-rate 10` — that misaligns vision and joints in training data.
+
 Check camera IDs first:
 
 ```bash
@@ -80,14 +95,16 @@ uv run python record/record_episodes_3cam.py \
   --leader-port /dev/ttyACM0 \
   --leader-baud 57600 \
   --teleop-rate 10 \
-  --video-cam-head 8 \
-  --video-cam-left-wrist 0 \
-  --video-cam-right-wrist 4 \
+  --dt 0.1 \
+  --video-cam-head 0 \
+  --video-cam-left-wrist 1 \
+  --video-cam-right-wrist 7 \
   --task "pick up the object and place it in the tray"
 ```
 
 Notes:
 
+- `--teleop-rate 10` and `--dt 0.1` must match (both 10 Hz).
 - Recording starts after the countdown and `Start teleoperating now.` message.
 - `Ctrl+C` ends current episode and saves what is captured.
 - Re-running the same command auto-increments `episode_XXXXXX.hdf5`.
@@ -119,9 +136,10 @@ uv run python record/visualize_recorded_episodes.py \
 
 Checklist before conversion:
 
+- HDF5 `fps` attribute is ~10 (from `--dt 0.1`), not ~30.
 - Camera streams are synchronized and not swapped.
 - Task text overlay is correct.
-- `qpos` and `action` traces look smooth and physically plausible.
+- `qpos` and `action` traces look smooth and physically plausible (no repeated joint rows between image changes).
 
 ---
 
@@ -133,10 +151,12 @@ Checklist before conversion:
 uv run python record/convert_3cam_to_groot_lerobot.py \
   --raw-dir "${RAW_DIR}" \
   --repo-id "${REPO_ID}" \
-  --fps 30 \
+  --fps 10 \
   --state-dim 12 \
   --action-dim 12
 ```
+
+`--fps` must match the record loop rate (`1 / --dt`, i.e. `10` when `--dt 0.1`).
 
 ### 3.2 LeRobot v3 -> v2.1 (required for GR00T loader)
 
@@ -193,7 +213,7 @@ CUDA_VISIBLE_DEVICES=0 uv run python gr00t/experiment/launch_finetune.py \
   --modality-config-path record/custom_3cam_config.py \
   --num-gpus "${NUM_GPUS}" \
   --output-dir "${FT_OUT}" \
-  --max-steps 20000 \
+  --max-steps 10000 \
   --save-steps 2000 \
   --save-total-limit 5 \
   --global-batch-size 4 \
@@ -249,17 +269,37 @@ uv run python record/policy_client_3cam.py \
   --port 5555 \
   --task "pick up the object and place it in the tray" \
   --robot robstride \
-  --video-cam-head 4 \
+  --video-cam-head 8 \
   --video-cam-left-wrist 0 \
-  --video-cam-right-wrist 8 \
+  --video-cam-right-wrist 4 \
   --apply-actions
 ```
 
-Useful tuning flags:
+Recommended flags for smooth motion and reliable gripping (defaults in the client are tuned toward this):
 
-- `--policy-ramp-max-speed 1.5` to make initial motion gentler.
-- `--ramp-from-feedback` only if needed (can introduce oscillation in some setups).
-- `--negate-a12-indices 1` to test a sign flip for the second left-arm joint (motor 3) if motion direction is inverted.
+```bash
+uv run python record/policy_client_3cam.py \
+  --host localhost --port 5555 \
+  --task "pick up the object and place it in the tray" \
+  --robot robstride \
+  --video-cam-head 8 --video-cam-left-wrist 0 --video-cam-right-wrist 4 \
+  --apply-actions \
+  --control-mode chunk \
+  --rate-hz 10 \
+  --policy-ramp-max-speed 3.0 \
+  --action-smoothing-alpha 0.4 \
+  --gripper-smoothing-alpha 0.75 \
+  --max-target-step-gripper 0.02
+```
+
+- `**--control-mode chunk**` (default): execute the full 16-step policy horizon before re-inferring; avoids jerky “always use horizon index 0” behavior.
+- `**--rate-hz 10**`: match recording (`--teleop-rate 10`, `--dt 0.1`) and convert (`--fps 10`).
+- `**--gripper-smoothing-alpha` / `--max-target-step-gripper**`: slow jaw target changes so the gripper can close on the object without snapping open.
+- `**--policy-ramp-max-speed**`: MIT slew cap (try 2.5–4.0; 6 is fast but needs chunk + smoothing).
+- `**--infer-stride 8**`: re-plan more often (less smooth, more reactive).
+- `**--control-mode legacy**`: old one-query-per-tick behavior (debug only).
+- `**--ramp-from-feedback**`: only if needed (can oscillate).
+- `**--negate-a12-indices 1**`: test sign flip for left joint motor 3 if inverted.
 
 Real-robot validation checklist:
 
@@ -295,9 +335,9 @@ uv run python scripts/deployment/benchmark_inference.py
 
 ## End-to-end quick checklist
 
-1. Record demos with correct camera IDs and consistent task text.
+1. Record demos at **10 Hz** (`--teleop-rate 10`, `--dt 0.1`), correct camera IDs, and consistent task text.
 2. Visualize raw episodes and remove bad captures.
-3. Convert raw -> LeRobot -> v2.1 and restore `meta/modality.json`.
+3. Convert raw -> LeRobot -> v2.1 with `--fps 10` and restore `meta/modality.json`.
 4. Generate stats with `record/custom_3cam_config.py`.
 5. Fine-tune to `"${FT_OUT}"`.
 6. Run open-loop eval with `--model-path "${CKPT}"`.
