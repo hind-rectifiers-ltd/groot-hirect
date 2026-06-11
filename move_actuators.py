@@ -36,7 +36,9 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -73,8 +75,8 @@ RAMP_DT_MAX_S = 0.1          # cap on dt used for ramp step calculation
 
 # Command safety: compare targets to live encoder reads in the motor's native frame.
 # Uses per-step delta limits (not abs(angle) > pi) so wrapped encoders near 2*pi do not false-trip.
-SAFETY_MAX_DELTA_RAD = 0.75          # max |target - encoder| per command tick
-SAFETY_MAX_INITIAL_DELTA_RAD = 0.5   # stricter limit on the first command after connect
+SAFETY_MAX_DELTA_RAD = 1.5           # max |ramped target - encoder| per command tick
+SAFETY_MAX_INITIAL_DELTA_RAD = 1.0   # stricter limit on the first command after connect
 SAFETY_EXCLUDED_MOTOR_IDS: tuple[int, ...] = (11, 12)  # grippers
 
 NUM_JOINTS = 12
@@ -146,13 +148,18 @@ def _open_bus(RobstrideBus, Motor, ParameterType, can_channel: str, motor_ids: l
         return None, []
 
 
+def _shortest_delta_rad(to_angle: float, from_angle: float) -> float:
+    """Signed shortest rotation from ``from_angle`` to ``to_angle`` (rad)."""
+    d = float(to_angle) - float(from_angle)
+    return (d + np.pi) % (2.0 * np.pi) - np.pi
+
+
 def _ramp_toward(current: float, desired: float, max_step: float) -> float:
-    err = desired - current
-    if err > max_step:
-        return current + max_step
-    if err < -max_step:
-        return current - max_step
-    return desired
+    """Step toward ``desired`` along the shortest angular path (handles ~2π encoder wraps)."""
+    err = _shortest_delta_rad(desired, current)
+    if abs(err) <= max_step:
+        return current + err
+    return current + (max_step if err > 0.0 else -max_step)
 
 
 def _pad12(q: np.ndarray | list | tuple) -> np.ndarray:
@@ -191,6 +198,8 @@ class ActuatorController:
         safety_max_initial_delta_rad: float = SAFETY_MAX_INITIAL_DELTA_RAD,
         safety_excluded_motor_ids: tuple[int, ...] = SAFETY_EXCLUDED_MOTOR_IDS,
         safety_abort_on_breach: bool = True,
+        read_max_retries: int = 4,
+        parallel_bus_reads: bool = True,
     ):
         """
         Args:
@@ -202,6 +211,8 @@ class ActuatorController:
             safety_max_initial_delta_rad: Limit for the first command after :meth:`connect`.
             safety_excluded_motor_ids: Motor IDs skipped by safety delta checks.
             safety_abort_on_breach: If True, disable torque and disconnect on breach.
+            read_max_retries: Per-motor MECHANICAL_POSITION retries after stale RX frames.
+            parallel_bus_reads: Read ``can0`` and ``can1`` halves in parallel when both are live.
         """
         self._ramp = bool(ramp)
         self._ramp_max_speed = float(ramp_max_speed_rad_s)
@@ -212,6 +223,9 @@ class ActuatorController:
         self._safety_excluded_motor_ids = {int(mid) for mid in safety_excluded_motor_ids}
         self._safety_abort_on_breach = bool(safety_abort_on_breach)
         self._safety_command_count = 0
+        self._read_max_retries = max(0, int(read_max_retries))
+        self._parallel_bus_reads = bool(parallel_bus_reads)
+        self._read_stats_lock = threading.Lock()
 
         self._left_bus = None
         self._right_bus = None
@@ -287,12 +301,22 @@ class ActuatorController:
             return self._left_bus is not None and len(self._left_motors) > 0
         return self._right_bus is not None and len(self._right_motors) > 0
 
-    def _enforce_command_safety(self, desired12: np.ndarray) -> None:
+    def _enforce_command_safety(
+        self,
+        desired12: np.ndarray,
+        *,
+        feedback12: np.ndarray | list | tuple | None = None,
+    ) -> None:
         """
-        Abort if any commanded target is too far from the live encoder (raw frame).
+        Abort if any ramp-limited target is too far from the live encoder.
 
-        This catches frame mistakes (e.g. sending ~0 rad to a joint reporting ~6.2 rad)
-        without rejecting valid wrapped readings via a naive abs(angle) > pi check.
+        Uses shortest angular distance so joints near ±2π (e.g. encoder 6.25 rad vs
+        0.02 rad) are treated as ~0.05 rad apart, not ~6.2 rad.
+
+        Args:
+            feedback12: Optional encoder-frame joint vector from a read in the same
+                        control tick. When provided, skips a second ``read_joints12``
+                        call (saves ~10 ms per command at 30 Hz).
         """
         if not self._safety_enabled:
             self._safety_command_count += 1
@@ -308,7 +332,10 @@ class ActuatorController:
         if limit <= 0.0:
             return
 
-        current = self.read_joints12()
+        if feedback12 is not None:
+            current = _pad12(feedback12)
+        else:
+            current = self.read_joints12()
         breaches: list[tuple[int, float, float, float]] = []
         for i in range(NUM_JOINTS):
             if not self._joint_bus_live(i):
@@ -318,7 +345,7 @@ class ActuatorController:
                 continue
             enc = float(current[i])
             tgt = float(desired12[i])
-            delta = abs(tgt - enc)
+            delta = abs(_shortest_delta_rad(tgt, enc))
             if delta > limit:
                 breaches.append((mid, enc, tgt, delta))
 
@@ -364,6 +391,7 @@ class ActuatorController:
         angles12: np.ndarray | list | tuple,
         *,
         ramp: bool | None = None,
+        feedback12: np.ndarray | list | tuple | None = None,
     ) -> np.ndarray:
         """
         Send MIT position targets to all 12 joints.
@@ -372,13 +400,15 @@ class ActuatorController:
             angles12: Target joint angles in radians.  Length must be 12.
                       Order: [L0, L1, L2, L3, L4, Lg, R0, R1, R2, R3, R4, Rg].
             ramp: Override the instance-level ramp setting for this call only.
+            feedback12: Optional encoder-frame qpos from the same tick (see
+                        :meth:`_enforce_command_safety`).
 
         Returns:
             The 12 targets actually written to the motors (after ramp limiting).
 
         Raises:
             RuntimeError: if not connected.
-            SafetyLimitBreachError: if a target is too far from the current encoder reading.
+            SafetyLimitBreachError: if a ramp-limited target is too far from the encoder reading.
         """
         if not self._connected:
             raise RuntimeError(
@@ -386,7 +416,6 @@ class ActuatorController:
             )
 
         q = _pad12(angles12)
-        self._enforce_command_safety(q)
         use_ramp = self._ramp if ramp is None else bool(ramp)
 
         # Compute ramp step from elapsed time
@@ -399,28 +428,35 @@ class ActuatorController:
 
         sent = np.zeros(NUM_JOINTS, dtype=np.float64)
 
-        for i, (name, mid) in enumerate(self._left_motors):
+        for i, (name, _mid) in enumerate(self._left_motors):
             desired = float(q[i])
             target = _ramp_toward(self._ramped.get(name, desired), desired, max_step)
             self._ramped[name] = target
             sent[i] = target
+
+        for i, (name, _mid) in enumerate(self._right_motors):
+            desired = float(q[6 + i])
+            target = _ramp_toward(self._ramped.get(name, desired), desired, max_step)
+            self._ramped[name] = target
+            sent[6 + i] = target
+
+        # Safety applies to ramp-limited targets actually sent, not the full policy horizon.
+        self._enforce_command_safety(sent, feedback12=feedback12)
+
+        for i, (name, mid) in enumerate(self._left_motors):
             if self._left_bus:
                 try:
                     self._left_bus.write_operation_frame(
-                        name, target, MOTOR_KP[mid], MOTOR_KD[mid], 0.0, 0.0
+                        name, sent[i], MOTOR_KP[mid], MOTOR_KD[mid], 0.0, 0.0
                     )
                 except Exception:
                     pass
 
         for i, (name, mid) in enumerate(self._right_motors):
-            desired = float(q[6 + i])
-            target = _ramp_toward(self._ramped.get(name, desired), desired, max_step)
-            self._ramped[name] = target
-            sent[6 + i] = target
             if self._right_bus:
                 try:
                     self._right_bus.write_operation_frame(
-                        name, target, MOTOR_KP[mid], MOTOR_KD[mid], 0.0, 0.0
+                        name, sent[6 + i], MOTOR_KP[mid], MOTOR_KD[mid], 0.0, 0.0
                     )
                 except Exception:
                     pass
@@ -512,10 +548,28 @@ class ActuatorController:
                     break
                 drained += 1
 
-        self._rx_frames_drained += drained
+        with self._read_stats_lock:
+            self._rx_frames_drained += drained
         return drained
 
-    def _read_one_with_retry(self, bus, name: str, *, max_retries: int = 2) -> float:
+    def _read_bus_joints(
+        self,
+        bus,
+        motors: list[tuple[str, int]],
+        *,
+        drain_rx: bool,
+    ) -> np.ndarray:
+        """Read one arm half (6 joints) from a single CAN bus."""
+        out = np.zeros(len(motors), dtype=np.float64)
+        if bus is None or not motors:
+            return out
+        if drain_rx:
+            self._drain_bus_rx(bus)
+        for i, (name, _) in enumerate(motors):
+            out[i] = self._read_one_with_retry(bus, name)
+        return out
+
+    def _read_one_with_retry(self, bus, name: str, *, max_retries: int | None = None) -> float:
         """
         Read MECHANICAL_POSITION for a single motor with self-healing retry.
 
@@ -524,9 +578,11 @@ class ActuatorController:
         fails and the actual read reply gets stuck behind it.  We catch that, peel one
         stale frame off the RX queue (one retry per stale frame), and try again.
         """
-        self._read_attempts += 1
+        retries = self._read_max_retries if max_retries is None else max(0, int(max_retries))
+        with self._read_stats_lock:
+            self._read_attempts += 1
         last_exc: Exception | None = None
-        for attempt in range(max_retries + 1):
+        for attempt in range(retries + 1):
             try:
                 return float(bus.read(name, self._ParameterType.MECHANICAL_POSITION))
             except Exception as exc:
@@ -541,8 +597,10 @@ class ActuatorController:
                     handler.recv(timeout=0.002)
                 except Exception:
                     pass
-                self._rx_frames_drained += 1
-        self._read_failures += 1
+                with self._read_stats_lock:
+                    self._rx_frames_drained += 1
+        with self._read_stats_lock:
+            self._read_failures += 1
         _ = last_exc  # kept for future debugging
         return 0.0
 
@@ -557,20 +615,44 @@ class ActuatorController:
         """
         if not self._connected:
             raise RuntimeError("[move_actuators] Not connected.")
-        self._read_calls += 1
+        with self._read_stats_lock:
+            self._read_calls += 1
         out = np.zeros(NUM_JOINTS, dtype=np.float64)
 
-        if drain_rx:
-            self._drain_bus_rx(self._left_bus)
-        if self._left_bus is not None:
-            for i, (name, _) in enumerate(self._left_motors):
-                out[i] = self._read_one_with_retry(self._left_bus, name)
-
-        if drain_rx:
-            self._drain_bus_rx(self._right_bus)
-        if self._right_bus is not None:
-            for i, (name, _) in enumerate(self._right_motors):
-                out[6 + i] = self._read_one_with_retry(self._right_bus, name)
+        use_parallel = (
+            self._parallel_bus_reads
+            and self._left_bus is not None
+            and self._right_bus is not None
+            and self._left_motors
+            and self._right_motors
+        )
+        if use_parallel:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                f_left = pool.submit(
+                    self._read_bus_joints,
+                    self._left_bus,
+                    self._left_motors,
+                    drain_rx=drain_rx,
+                )
+                f_right = pool.submit(
+                    self._read_bus_joints,
+                    self._right_bus,
+                    self._right_motors,
+                    drain_rx=drain_rx,
+                )
+                left = f_left.result()
+                right = f_right.result()
+            out[:6] = left
+            out[6:] = right
+        else:
+            if self._left_bus is not None:
+                out[:6] = self._read_bus_joints(
+                    self._left_bus, self._left_motors, drain_rx=drain_rx
+                )
+            if self._right_bus is not None:
+                out[6:] = self._read_bus_joints(
+                    self._right_bus, self._right_motors, drain_rx=drain_rx
+                )
 
         return out
 

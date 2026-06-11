@@ -64,18 +64,28 @@ export CKPT="${FT_OUT}/checkpoint-10000"
 
 ### Timing (important for GR00T)
 
-Keep **motors, camera sampling, conversion fps, and deployment rate** on the same clock:
+Keep **motors, camera sampling, conversion fps, and deployment rate** on the same clock (**30 Hz / 30 fps** for this setup):
 
 
-| Stage                                          | Flag            | Value         |
-| ---------------------------------------------- | --------------- | ------------- |
-| Follower teleop                                | `--teleop-rate` | `10`          |
-| Record loop (images + `qpos`/`action` logging) | `--dt`          | `0.1` (10 Hz) |
-| LeRobot convert                                | `--fps`         | `10`          |
-| Policy client                                  | `--rate-hz`     | `10`          |
+| Stage                                          | Flag                    | Value                            |
+| ---------------------------------------------- | ----------------------- | -------------------------------- |
+| Follower teleop                                | `--teleop-rate`         | `30`                             |
+| Record loop (images + `qpos`/`action` logging) | `--dt`                  | `0.0333333` (~30 Hz)             |
+| Qpos filtering at 30 Hz                        | `--qpos-median-samples` | `2` (auto when teleop-rate ≥ 20) |
+| LeRobot convert                                | `--fps`                 | `30`                             |
+| Policy client                                  | `--rate-hz`             | `30`                             |
 
 
-USB cameras may run faster internally; the recorder grabs **one frame per `--dt` tick**. Do **not** use default `--dt 1/30` (~30 Hz) with `--teleop-rate 10` — that misaligns vision and joints in training data.
+USB cameras may run faster internally; the recorder grabs **one frame per `--dt` tick**. Do **not** mix rates (e.g. `--dt 0.1` with `--teleop-rate 30`) — that misaligns vision and joints in training data.
+
+Validate CAN on the robot before your first 30 Hz session (arm still, both buses up):
+
+```bash
+uv run python scripts/benchmark_follower_hz.py \
+  --rates 30 --mode record --median-samples 2 --duration-s 20
+```
+
+Expect **PASS** (~22 ms/tick). See [Validate CAN before recording](#validate-can-before-recording) for the full sweep.
 
 Check camera IDs first:
 
@@ -86,7 +96,7 @@ uv run python record/record_episodes_3cam.py \
   --test-cameras-max 16
 ```
 
-Record with direct teleop + RobStride follower + 3 cameras:
+Record with direct teleop + RobStride follower + 3 cameras (**30 Hz / 30 fps**):
 
 ```bash
 uv run python record/record_episodes_3cam.py \
@@ -94,20 +104,39 @@ uv run python record/record_episodes_3cam.py \
   --robot direct_teleop \
   --leader-port /dev/ttyACM0 \
   --leader-baud 57600 \
-  --teleop-rate 10 \
-  --dt 0.1 \
-  --video-cam-head 0 \
-  --video-cam-left-wrist 1 \
-  --video-cam-right-wrist 7 \
+  --teleop-rate 30 \
+  --dt 0.0333333 \
+  --qpos-median-samples 2 \
+  --video-cam-head 8 \
+  --video-cam-left-wrist 0 \
+  --video-cam-right-wrist 3 \
   --task "pick up the object and place it in the tray"
 ```
 
 Notes:
 
-- `--teleop-rate 10` and `--dt 0.1` must match (both 10 Hz).
+- `--teleop-rate 30`, `--dt 0.0333333`, and convert `--fps 30` must all match.
+- At ≥ 20 Hz the recorder auto-uses **2 back-to-back median reads** (no gap), zero-dropout filter only, parallel CAN reads, and `feedback12` on commands.
 - Recording starts after the countdown and `Start teleoperating now.` message.
 - `Ctrl+C` ends current episode and saves what is captured.
 - Re-running the same command auto-increments `episode_XXXXXX.hdf5`.
+- After a test episode, confirm HDF5 `fps` ≈ 30 (cameras must keep up with `--dt`).
+
+### Validate CAN before recording
+
+Optional full sweep (read → teleop → record):
+
+```bash
+uv run python scripts/benchmark_follower_hz.py --rates 10 20 30 --mode read --duration-s 20
+uv run python scripts/benchmark_follower_hz.py --rates 10 20 30 --mode teleop --duration-s 20
+uv run python scripts/benchmark_follower_hz.py --rates 10 20 30 --mode record --median-samples 1 --duration-s 15
+```
+
+Each trial prints **PASS/FAIL** (actual Hz ≥ 95% of target, ≤5% missed deadlines, ≤1% read failures, no zero dropouts).
+
+Do **not** use `--qpos-median-samples 1` or `3` at 30 Hz (1 = no spike rejection; 3 = too slow). After each episode, check for `qpos sanitizer holds` — **re-record if `zero_dropouts > 0`**.
+
+**Lower rate fallback:** for debugging only, use `--teleop-rate 10 --dt 0.1`, convert `--fps 10`, deploy `--rate-hz 10`.
 
 ---
 
@@ -136,7 +165,7 @@ uv run python record/visualize_recorded_episodes.py \
 
 Checklist before conversion:
 
-- HDF5 `fps` attribute is ~10 (from `--dt 0.1`), not ~30.
+- HDF5 `fps` attribute is ~30 (from `--dt 0.0333333`).
 - Camera streams are synchronized and not swapped.
 - Task text overlay is correct.
 - `qpos` and `action` traces look smooth and physically plausible (no repeated joint rows between image changes).
@@ -151,12 +180,12 @@ Checklist before conversion:
 uv run python record/convert_3cam_to_groot_lerobot.py \
   --raw-dir "${RAW_DIR}" \
   --repo-id "${REPO_ID}" \
-  --fps 10 \
+  --fps 30 \
   --state-dim 12 \
   --action-dim 12
 ```
 
-`--fps` must match the record loop rate (`1 / --dt`, i.e. `10` when `--dt 0.1`).
+`--fps` must match the record loop rate (`1 / --dt`, i.e. `30` when `--dt 0.0333333`).
 
 ### 3.2 LeRobot v3 -> v2.1 (required for GR00T loader)
 
@@ -270,8 +299,8 @@ uv run python record/policy_client_3cam.py \
   --task "pick up the object and place it in the tray" \
   --robot robstride \
   --video-cam-head 8 \
-  --video-cam-left-wrist 0 \
-  --video-cam-right-wrist 4 \
+  --video-cam-left-wrist 4 \
+  --video-cam-right-wrist 0 \
   --apply-actions
 ```
 
@@ -282,10 +311,10 @@ uv run python record/policy_client_3cam.py \
   --host localhost --port 5555 \
   --task "pick up the object and place it in the tray" \
   --robot robstride \
-  --video-cam-head 8 --video-cam-left-wrist 0 --video-cam-right-wrist 4 \
+  --video-cam-head 18 --video-cam-left-wrist 4 --video-cam-right-wrist 0 \
   --apply-actions \
   --control-mode chunk \
-  --rate-hz 10 \
+  --rate-hz 30 \
   --policy-ramp-max-speed 3.0 \
   --action-smoothing-alpha 0.4 \
   --gripper-smoothing-alpha 0.75 \
@@ -293,7 +322,7 @@ uv run python record/policy_client_3cam.py \
 ```
 
 - `**--control-mode chunk**` (default): execute the full 16-step policy horizon before re-inferring; avoids jerky “always use horizon index 0” behavior.
-- `**--rate-hz 10**`: match recording (`--teleop-rate 10`, `--dt 0.1`) and convert (`--fps 10`).
+- `**--rate-hz 30**`: match recording (`--teleop-rate 30`, `--dt 0.0333333`) and convert (`--fps 30`).
 - `**--gripper-smoothing-alpha` / `--max-target-step-gripper**`: slow jaw target changes so the gripper can close on the object without snapping open.
 - `**--policy-ramp-max-speed**`: MIT slew cap (try 2.5–4.0; 6 is fast but needs chunk + smoothing).
 - `**--infer-stride 8**`: re-plan more often (less smooth, more reactive).
@@ -335,12 +364,12 @@ uv run python scripts/deployment/benchmark_inference.py
 
 ## End-to-end quick checklist
 
-1. Record demos at **10 Hz** (`--teleop-rate 10`, `--dt 0.1`), correct camera IDs, and consistent task text.
+1. Record demos at **30 Hz / 30 fps** (`--teleop-rate 30`, `--dt 0.0333333`, `--qpos-median-samples 2`), correct camera IDs, and consistent task text.
 2. Visualize raw episodes and remove bad captures.
-3. Convert raw -> LeRobot -> v2.1 with `--fps 10` and restore `meta/modality.json`.
+3. Convert raw -> LeRobot -> v2.1 with `--fps 30` and restore `meta/modality.json`.
 4. Generate stats with `record/custom_3cam_config.py`.
 5. Fine-tune to `"${FT_OUT}"`.
 6. Run open-loop eval with `--model-path "${CKPT}"`.
 7. Start GR00T server with `--model-path "${CKPT}"`.
-8. Validate closed-loop on robot with `record/policy_client_3cam.py`.
+8. Validate closed-loop on robot with `record/policy_client_3cam.py` at `--rate-hz 30`.
 

@@ -283,6 +283,8 @@ class PolicyRobstrideDriver:
         ramp_max_speed_rad_s: float | None = 2.5,
         ramp_from_feedback: bool = False,
         auto_zero: bool = True,
+        safety_max_delta_rad: float = 1.5,
+        safety_max_initial_delta_rad: float = 1.0,
     ):
         if str(_REPO_ROOT) not in sys.path:
             sys.path.insert(0, str(_REPO_ROOT))
@@ -303,6 +305,7 @@ class PolicyRobstrideDriver:
         # One-turn-unwrap offsets in the motor's encoder frame: read_qpos12 returns
         # (raw - boot_offsets); command_a12 sends (target + boot_offsets).
         self._boot_offsets: np.ndarray = np.zeros(12, dtype=np.float64)
+        self._last_raw_encoder: np.ndarray | None = None
         self._arm: ActuatorController | None = None
 
         if not dry_run:
@@ -315,6 +318,10 @@ class PolicyRobstrideDriver:
                 ramp=True,
                 ramp_max_speed_rad_s=ramp_speed,
                 ramp_dt_max_s=float(dt.ROBSTRIDE_RAMP_DT_MAX_S),
+                safety_max_delta_rad=float(safety_max_delta_rad),
+                safety_max_initial_delta_rad=float(safety_max_initial_delta_rad),
+                read_max_retries=4,
+                parallel_bus_reads=True,
             )
             try:
                 self._arm.connect()
@@ -366,12 +373,20 @@ class PolicyRobstrideDriver:
 
     # -- public API used by main() ---------------------------------------
 
+    def _read_raw_encoder_median(self, *, samples: int = 2) -> np.ndarray:
+        """Median of ``samples`` raw encoder reads (rejects single garbage CAN frames)."""
+        assert self._arm is not None
+        n = max(1, int(samples))
+        stack = [self._arm.read_joints12().astype(np.float64) for _ in range(n)]
+        return stack[0] if n == 1 else np.median(np.stack(stack, axis=0), axis=0)
+
     def read_qpos12(self) -> np.ndarray:
         """Return the 12-DoF follower pose in the *unwrapped* (software-zero) frame."""
         if self._arm is None:
             return np.zeros(12, dtype=np.float32)
-        raw = self._arm.read_joints12()
-        return (raw.astype(np.float64) - self._boot_offsets).astype(np.float32)
+        raw = self._read_raw_encoder_median()
+        self._last_raw_encoder = raw
+        return ((raw - self._boot_offsets + np.pi) % (2.0 * np.pi) - np.pi).astype(np.float32)
 
     def verify_zero_pose(
         self,
@@ -416,7 +431,7 @@ class PolicyRobstrideDriver:
         if self._arm is None:
             return
         # Seed in the motor's native (encoder) frame, since command_a12 writes in that frame.
-        raw_qpos = self._arm.read_joints12()
+        raw_qpos = self._read_raw_encoder_median(samples=3)
         self._arm.seed_ramp_from_angles(raw_qpos)
 
     def command_a12(self, target12: np.ndarray) -> None:
@@ -427,9 +442,12 @@ class PolicyRobstrideDriver:
             t = np.pad(t, (0, 12 - t.size))
         if self._ramp_from_feedback:
             # Re-seed the ramp from live encoders each tick (matches old behavior).
-            self._arm.seed_ramp_from_angles(self._arm.read_joints12())
+            self._arm.seed_ramp_from_angles(self._read_raw_encoder_median())
+            feedback = None
+        else:
+            feedback = self._last_raw_encoder
         encoder_target = t + self._boot_offsets
-        self._arm.command_joints12(encoder_target, ramp=True)
+        self._arm.command_joints12(encoder_target, ramp=True, feedback12=feedback)
 
     def close(self) -> None:
         if self._arm is None:
@@ -542,6 +560,18 @@ def main() -> None:
         "Use 0 to fall back to direct_teleop default (often 6.0). Default: 2.5",
     )
     p.add_argument(
+        "--safety-max-delta-rad",
+        type=float,
+        default=1.5,
+        help="Per-tick |ramped target - encoder| safety cap (rad). Default: 1.5",
+    )
+    p.add_argument(
+        "--safety-max-initial-delta-rad",
+        type=float,
+        default=1.0,
+        help="Safety cap on the first command after connect (rad). Default: 1.0",
+    )
+    p.add_argument(
         "--ramp-from-feedback",
         action="store_true",
         help="Each tick, slew from measured encoder position (can oscillate if policy jitters). "
@@ -599,6 +629,8 @@ def main() -> None:
                 ramp_max_speed_rad_s=ramp_cap,
                 ramp_from_feedback=args.ramp_from_feedback,
                 auto_zero=not args.no_software_zero,
+                safety_max_delta_rad=args.safety_max_delta_rad,
+                safety_max_initial_delta_rad=args.safety_max_initial_delta_rad,
             )
         except Exception as exc:
             print(f"\nERROR: failed to initialize RobStride driver: {exc}", file=sys.stderr, flush=True)

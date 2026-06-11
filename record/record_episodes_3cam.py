@@ -65,6 +65,8 @@ class QposReadSanitizer:
         self._last_good: np.ndarray | None = None
         self._hold_streak = np.zeros(12, dtype=np.int32)
         self._hold_events = 0
+        self._zero_holds = 0
+        self._jump_holds = 0
 
     @staticmethod
     def max_step_for_rate(control_rate_hz: float, *, ramp_speed_rad_s: float = 6.0) -> float:
@@ -83,6 +85,14 @@ class QposReadSanitizer:
     def hold_events(self) -> int:
         return int(self._hold_events)
 
+    @property
+    def zero_holds(self) -> int:
+        return int(self._zero_holds)
+
+    @property
+    def jump_holds(self) -> int:
+        return int(self._jump_holds)
+
     def apply(self, qpos12: np.ndarray) -> np.ndarray:
         q = np.asarray(qpos12, dtype=np.float64).reshape(-1)
         if q.size < 12:
@@ -96,11 +106,16 @@ class QposReadSanitizer:
         for i in range(12):
             v = float(q[i])
             prev = float(self._last_good[i])
-            if self._looks_like_bad_sample(v, prev):
+            bad_zero, bad_jump = self._bad_sample_reasons(v, prev)
+            if bad_zero or bad_jump:
                 if self._hold_streak[i] < self._max_hold_ticks:
                     out[i] = prev
                     self._hold_streak[i] += 1
                     self._hold_events += 1
+                    if bad_zero:
+                        self._zero_holds += 1
+                    if bad_jump:
+                        self._jump_holds += 1
                     continue
             self._hold_streak[i] = 0
             self._last_good[i] = v
@@ -111,13 +126,12 @@ class QposReadSanitizer:
         d = float(value) - float(last_good)
         return (d + np.pi) % (2.0 * np.pi) - np.pi
 
-    def _looks_like_bad_sample(self, value: float, last_good: float) -> bool:
-        if abs(value) <= self._zero_epsilon and abs(last_good) > self._last_good_min_rad:
-            return True
+    def _bad_sample_reasons(self, value: float, last_good: float) -> tuple[bool, bool]:
+        bad_zero = abs(value) <= self._zero_epsilon and abs(last_good) > self._last_good_min_rad
+        bad_jump = False
         if self._max_step_rad > 0.0:
-            if abs(self._shortest_delta_rad(value, last_good)) > self._max_step_rad:
-                return True
-        return False
+            bad_jump = abs(self._shortest_delta_rad(value, last_good)) > self._max_step_rad
+        return bad_zero, bad_jump
 
 
 def test_cameras(max_index: int, image_shape: tuple[int, int], warmup: int = 12, black_threshold: float = 5.0) -> None:
@@ -318,6 +332,8 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
         leader_port: str = "/dev/ttyACM0",
         leader_baud: int = 57600,
         control_rate: float = 10.0,
+        qpos_median_samples: int | None = None,
+        qpos_median_gap_s: float = 0.003,
         dry_run: bool = False,
         image_shape: tuple[int, int] = (240, 424),
     ):
@@ -358,12 +374,27 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
         # One-turn unwrap offsets in encoder frame. Reported qpos is (raw - offsets).
         self._boot_offsets = np.zeros(12, dtype=np.float64)
         self._control_rate_hz = float(control_rate)
-        self._qpos_sanitizer = QposReadSanitizer(
-            max_step_rad=QposReadSanitizer.max_step_for_rate(
+        if qpos_median_samples is None:
+            # 2 back-to-back reads reject single-frame CAN spikes (~22 ms/tick at 30 Hz).
+            if self._control_rate_hz >= 20.0:
+                qpos_median_samples = 2
+            else:
+                qpos_median_samples = 3
+        self._qpos_median_samples = max(1, int(qpos_median_samples))
+        # No sleep between median samples at high rate — gap only costs latency.
+        if qpos_median_gap_s == 0.003 and self._control_rate_hz >= 20.0:
+            qpos_median_gap_s = 0.0
+        self._qpos_median_gap_s = max(0.0, float(qpos_median_gap_s))
+        # At 30 Hz the per-tick jump filter false-triggers on real teleop motion; keep zero-dropout only.
+        jump_limit = (
+            0.0
+            if self._control_rate_hz >= 20.0
+            else QposReadSanitizer.max_step_for_rate(
                 self._control_rate_hz,
                 ramp_speed_rad_s=dt.ROBSTRIDE_RAMP_MAX_SPEED_RAD_S,
-            ),
+            )
         )
+        self._qpos_sanitizer = QposReadSanitizer(max_step_rad=jump_limit)
 
         self._arm: ActuatorController | None = None
         if not self._dry_run:
@@ -371,6 +402,8 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
                 ramp=True,
                 ramp_max_speed_rad_s=dt.ROBSTRIDE_RAMP_MAX_SPEED_RAD_S,
                 ramp_dt_max_s=dt.ROBSTRIDE_RAMP_DT_MAX_S,
+                read_max_retries=4,
+                parallel_bus_reads=True,
             )
             self._arm.connect()
             self._capture_boot_offsets()
@@ -394,6 +427,13 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
             daemon=True,
         )
         self._thread.start()
+        if self._control_rate_hz >= 20.0:
+            print(
+                f"[record] High-rate qpos: median_samples={self._qpos_median_samples}, "
+                f"gap_s={self._qpos_median_gap_s}, teleop_rate={control_rate} Hz "
+                "(2-sample median + zero-dropout filter; jump filter off)",
+                flush=True,
+            )
 
     def _capture_boot_offsets(self, *, settle_reads: int = 3) -> None:
         """Apply one-turn software unwrap so home near 0 is represented near 0."""
@@ -419,21 +459,50 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
         else:
             print("[record] Software zero: all joints already inside (-pi, +pi).", flush=True)
 
-    def _read_qpos12_raw(self, *, samples: int = 3, sample_gap_s: float = 0.003) -> np.ndarray:
+    def _read_qpos12_raw(self, *, samples: int | None = None, sample_gap_s: float | None = None) -> np.ndarray:
         """
         Read follower pose in unwrapped software-zero frame (no dropout filtering).
 
         Takes the per-joint median of ``samples`` reads to reject single garbage frames.
         """
         assert self._arm is not None
-        n = max(1, int(samples))
+        n = max(1, int(samples if samples is not None else self._qpos_median_samples))
+        gap = self._qpos_median_gap_s if sample_gap_s is None else max(0.0, float(sample_gap_s))
         stack = []
         for s in range(n):
             raw = self._arm.read_joints12().astype(np.float64)
             stack.append(raw - self._boot_offsets)
-            if s + 1 < n and sample_gap_s > 0.0:
-                time.sleep(sample_gap_s)
+            if s + 1 < n and gap > 0.0:
+                time.sleep(gap)
         return np.median(np.stack(stack, axis=0), axis=0)
+
+    def _read_qpos12_for_command(self) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Read qpos for logging and return raw encoder feedback for the same tick.
+
+        Returns:
+            qpos: normalized software-zero frame for dataset logging.
+            raw_encoder: native encoder frame for ``command_joints12(feedback12=...)``.
+        """
+        assert self._arm is not None
+        n = self._qpos_median_samples
+        gap = self._qpos_median_gap_s
+        stack_sw: list[np.ndarray] = []
+        stack_raw: list[np.ndarray] = []
+        for s in range(n):
+            raw = self._arm.read_joints12().astype(np.float64)
+            stack_raw.append(raw)
+            stack_sw.append(raw - self._boot_offsets)
+            if s + 1 < n and gap > 0.0:
+                time.sleep(gap)
+        if n == 1:
+            raw_encoder = stack_raw[0]
+            sw = stack_sw[0]
+        else:
+            raw_encoder = np.median(np.stack(stack_raw, axis=0), axis=0)
+            sw = np.median(np.stack(stack_sw, axis=0), axis=0)
+        qpos = _normalize_qpos_to_pi(self._qpos_sanitizer.apply(sw))
+        return qpos, raw_encoder
 
     def _read_qpos12(self) -> np.ndarray:
         """Read qpos with median filtering and last-good hold for bad samples."""
@@ -548,8 +617,8 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
 
             # Read qpos *before* commanding so MIT status frames do not corrupt the read.
             if self._arm is not None:
-                qpos = self._read_qpos12()
-                sent = self._arm.command_joints12(targets, ramp=True)
+                qpos, raw_encoder = self._read_qpos12_for_command()
+                sent = self._arm.command_joints12(targets, ramp=True, feedback12=raw_encoder)
                 action = _normalize_qpos_to_pi(sent.astype(np.float64) - self._boot_offsets)
             else:
                 sent = targets
@@ -586,10 +655,17 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
                 print(self._arm.read_stats_line(), flush=True)
             except Exception:
                 pass
-            if self._qpos_sanitizer.hold_events > 0:
+            holds = self._qpos_sanitizer.hold_events
+            if holds > 0:
                 print(
-                    f"[record] qpos dropout holds applied: {self._qpos_sanitizer.hold_events} "
-                    "(failed CAN reads replaced with last-good values)",
+                    f"[record] qpos sanitizer holds: total={holds} "
+                    f"(zero_dropouts={self._qpos_sanitizer.zero_holds}, "
+                    f"jump_rejects={self._qpos_sanitizer.jump_holds})",
+                    flush=True,
+                )
+                print(
+                    "[record] WARNING: held qpos pollutes training data — "
+                    "re-record this episode if zero_dropouts > 0.",
                     flush=True,
                 )
             try:
@@ -781,6 +857,18 @@ def main() -> None:
     p.add_argument("--leader-port", type=str, default="/dev/ttyACM0")
     p.add_argument("--leader-baud", type=int, default=57600)
     p.add_argument("--teleop-rate", type=float, default=10.0)
+    p.add_argument(
+        "--qpos-median-samples",
+        type=int,
+        default=None,
+        help="Per-tick encoder reads for qpos median (default: 2 if teleop-rate >=20, else 3)",
+    )
+    p.add_argument(
+        "--qpos-median-gap-ms",
+        type=float,
+        default=3.0,
+        help="Gap between median samples in ms (auto 0 at teleop-rate >=20)",
+    )
     p.add_argument("--dry-run-teleop", action="store_true")
     p.add_argument("--episode-idx", type=int, default=None)
     p.add_argument("--no-qvel", action="store_true")
@@ -820,6 +908,8 @@ def main() -> None:
                 leader_port=args.leader_port,
                 leader_baud=args.leader_baud,
                 control_rate=args.teleop_rate,
+                qpos_median_samples=args.qpos_median_samples,
+                qpos_median_gap_s=max(0.0, args.qpos_median_gap_ms / 1000.0),
                 dry_run=args.dry_run_teleop,
                 image_shape=(args.image_height, args.image_width),
             )
