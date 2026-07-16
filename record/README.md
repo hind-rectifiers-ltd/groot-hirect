@@ -17,6 +17,8 @@ Use this as an actionable runbook from data collection to real robot rollout.
 - `record/convert_3cam_to_groot_lerobot.py`: converts raw episodes to LeRobot (v3 layout first).
 - `record/custom_3cam_config.py`: registers modality config for `NEW_EMBODIMENT`.
 - `record/policy_client_3cam.py`: client for GR00T server (USB cam / demo / RobStride backends).
+- `record/usb_cameras.py` + `record/camera_ports.json`: stable USB port → camera role mapping.
+- `record/preview_three_cameras.py`: live labeled preview to confirm HEAD / wrist mapping.
 
 ---
 
@@ -58,6 +60,54 @@ export CKPT="${FT_OUT}/checkpoint-10000"
 
 `HF_LEROBOT_HOME` is what the LeRobot converter uses; `HF_HOME` routes large Hugging Face / Transformers downloads (e.g. base model) to the SSD. `FT_OUT` is the training output directory and `CKPT` points to one specific checkpoint inside it — use `"${CKPT}"` everywhere the README needs a checkpoint path. Update the checkpoint number whenever you train further (or use the `ls`-based tip above).
 
+### Camera setup (USB ports, not `/dev/videoN`)
+
+On Linux, **do not rely on numeric camera indices** (`/dev/video0`, `/dev/video8`, …) — they change across reboots. Instead, cameras are pinned by **physical USB port** in `record/camera_ports.json` and resolved automatically when `--use-usb-camera-ports` is set (default on Linux for record + policy client).
+
+Verified mapping for this rig:
+
+
+| Role        | HDF5 / LeRobot key | USB port (`id_path_tag`)   | Typical node  |
+| ----------- | ------------------ | -------------------------- | ------------- |
+| Head        | `cam_head`         | `pci-0000_00_14_0-usb-0_8` | `/dev/video8` |
+| Left wrist  | `cam_left_wrist`   | `pci-0000_00_14_0-usb-0_9` | `/dev/video6` |
+| Right wrist | `cam_right_wrist`  | `pci-0000_00_14_0-usb-0_3` | `/dev/video0` |
+
+
+The JSON on disk:
+
+```json
+{
+  "cam_head": {"id_path_tag": "pci-0000_00_14_0-usb-0_8"},
+  "cam_left_wrist": {"id_path_tag": "pci-0000_00_14_0-usb-0_9"},
+  "cam_right_wrist": {"id_path_tag": "pci-0000_00_14_0-usb-0_3"}
+}
+```
+
+**Before every record or inference session** (or after moving USB cables), confirm labels with a live preview:
+
+```bash
+uv run python record/preview_three_cameras.py
+```
+
+Wave each physical camera; the **HEAD**, **LEFT WRIST**, and **RIGHT WRIST** banners must match the view. Press **Esc** to quit.
+
+If a cable moved or you are setting up a new machine:
+
+```bash
+# Discover instance= all cameras at a time
+uv run python record/preview_three_cameras.py --preview-cameras
+# Discover instance= ids one camera at a time (Space = next, Esc = quit)
+uv run python record/preview_three_cameras.py --preview-all-cameras
+
+# Text-only listing
+uv run python record/record_episodes_3cam.py --list-cameras-working
+```
+
+Edit `record/camera_ports.json`, then run `preview_three_cameras.py` again until correct.
+
+Override a single role without editing JSON: `--video-cam-head /dev/video8`. Disable USB pinning: `--no-use-usb-camera-ports` plus explicit `--video-cam-*` indices.
+
 ---
 
 ## 1) Record episodes (v2 flow input)
@@ -87,14 +137,7 @@ uv run python scripts/benchmark_follower_hz.py \
 
 Expect **PASS** (~22 ms/tick). See [Validate CAN before recording](#validate-can-before-recording) for the full sweep.
 
-Check camera IDs first:
-
-```bash
-uv run python record/record_episodes_3cam.py \
-  --output-dir "${RAW_DIR}" \
-  --test-cameras \
-  --test-cameras-max 16
-```
+Confirm cameras first (`preview_three_cameras.py` — see [Camera setup](#camera-setup-usb-ports-not-devvideon)).
 
 Record with direct teleop + RobStride follower + 3 cameras (**30 Hz / 30 fps**):
 
@@ -107,20 +150,20 @@ uv run python record/record_episodes_3cam.py \
   --teleop-rate 30 \
   --dt 0.0333333 \
   --qpos-median-samples 2 \
-  --video-cam-head 8 \
-  --video-cam-left-wrist 0 \
-  --video-cam-right-wrist 3 \
+  --use-usb-camera-ports \
   --task "pick up the object and place it in the tray"
 ```
 
 Notes:
 
+- `--use-usb-camera-ports` (default on Linux) loads `record/camera_ports.json` — same mapping used at inference.
 - `--teleop-rate 30`, `--dt 0.0333333`, and convert `--fps 30` must all match.
 - At ≥ 20 Hz the recorder auto-uses **2 back-to-back median reads** (no gap), zero-dropout filter only, parallel CAN reads, and `feedback12` on commands.
 - Recording starts after the countdown and `Start teleoperating now.` message.
 - `Ctrl+C` ends current episode and saves what is captured.
 - Re-running the same command auto-increments `episode_XXXXXX.hdf5`.
 - After a test episode, confirm HDF5 `fps` ≈ 30 (cameras must keep up with `--dt`).
+- HDF5 stores `cam_head` / `cam_left_wrist` / `cam_right_wrist` by role name (not `/dev/videoN`), so conversion and training are unaffected by node renumbering as long as recording used the correct port mapping.
 
 ### Validate CAN before recording
 
@@ -165,8 +208,8 @@ uv run python record/visualize_recorded_episodes.py \
 
 Checklist before conversion:
 
+- Camera preview was verified (`preview_three_cameras.py`) before recording — head / wrists not swapped in HDF5.
 - HDF5 `fps` attribute is ~30 (from `--dt 0.0333333`).
-- Camera streams are synchronized and not swapped.
 - Task text overlay is correct.
 - `qpos` and `action` traces look smooth and physically plausible (no repeated joint rows between image changes).
 
@@ -186,6 +229,8 @@ uv run python record/convert_3cam_to_groot_lerobot.py \
 ```
 
 `--fps` must match the record loop rate (`1 / --dt`, i.e. `30` when `--dt 0.0333333`).
+
+Conversion reads HDF5 image keys (`cam_head`, `cam_left_wrist`, `cam_right_wrist`) — no camera device flags needed here. If wrist cameras look swapped in `visualize_recorded_episodes.py`, fix `camera_ports.json`, re-record; do not patch labels in the converter.
 
 ### 3.2 LeRobot v3 -> v2.1 (required for GR00T loader)
 
@@ -231,6 +276,8 @@ Rerun this whenever modality/action definitions change.
 
 ## 5) Fine-tune GR00T N1.7
 
+Training uses the LeRobot dataset on disk (video + state + action). Camera USB mapping is **not** involved at train time — only data recorded with the correct `camera_ports.json` mapping matters.
+
 Single-GPU command used in this setup:
 
 ```bash
@@ -246,8 +293,26 @@ CUDA_VISIBLE_DEVICES=0 uv run python gr00t/experiment/launch_finetune.py \
   --save-steps 2000 \
   --save-total-limit 5 \
   --global-batch-size 4 \
-  --dataloader-num-workers 2 \
+  --dataloader-num-workers 0 \
   --gradient-checkpointing
+```
+
+If the host runs out of RAM during training, resume from the same `--output-dir` with a smaller batch and no dataloader workers:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run python gr00t/experiment/launch_finetune.py \
+  --base-model-path nvidia/GR00T-N1.7-3B \
+  --dataset-path "${DS}" \
+  --embodiment-tag NEW_EMBODIMENT \
+  --modality-config-path record/custom_3cam_config.py \
+  --num-gpus 1 \
+  --output-dir "${FT_OUT}" \
+  --max-steps 10000 \
+  --save-steps 2000 \
+  --global-batch-size 2 \
+  --dataloader-num-workers 0 \
+  --gradient-checkpointing \
+  --shard-size 512
 ```
 
 Checkpoint example:
@@ -286,11 +351,19 @@ uv run python gr00t/eval/run_gr00t_server.py \
   --port 5555
 ```
 
+Keep this running; start the policy client in [section 8](#8-validate-on-real-hardware-policy_client_3campy).
+
 ---
 
 ## 8) Validate on real hardware (`policy_client_3cam.py`)
 
-Run RobStride client against server:
+Use the **same** `record/camera_ports.json` as recording. Preview before the first inference run:
+
+```bash
+uv run python record/preview_three_cameras.py
+```
+
+With the server from [section 7](#7-run-inference-server-with-fine-tuned-checkpoint) already running:
 
 ```bash
 uv run python record/policy_client_3cam.py \
@@ -298,44 +371,32 @@ uv run python record/policy_client_3cam.py \
   --port 5555 \
   --task "pick up the object and place it in the tray" \
   --robot robstride \
-  --video-cam-head 8 \
-  --video-cam-left-wrist 4 \
-  --video-cam-right-wrist 0 \
-  --apply-actions
-```
-
-Recommended flags for smooth motion and reliable gripping (defaults in the client are tuned toward this):
-
-```bash
-uv run python record/policy_client_3cam.py \
-  --host localhost --port 5555 \
-  --task "pick up the object and place it in the tray" \
-  --robot robstride \
-  --video-cam-head 18 --video-cam-left-wrist 4 --video-cam-right-wrist 0 \
+  --use-usb-camera-ports \
   --apply-actions \
   --control-mode chunk \
   --rate-hz 30 \
-  --policy-ramp-max-speed 3.0 \
-  --action-smoothing-alpha 0.4 \
-  --gripper-smoothing-alpha 0.75 \
-  --max-target-step-gripper 0.02
+  --policy-ramp-max-speed 2.5 \
+  --action-smoothing-alpha 0.5 \
+  --chunk-blend-steps 12
 ```
 
-- `**--control-mode chunk**` (default): execute the full 16-step policy horizon before re-inferring; avoids jerky “always use horizon index 0” behavior.
-- `**--rate-hz 30**`: match recording (`--teleop-rate 30`, `--dt 0.0333333`) and convert (`--fps 30`).
-- `**--gripper-smoothing-alpha` / `--max-target-step-gripper**`: slow jaw target changes so the gripper can close on the object without snapping open.
-- `**--policy-ramp-max-speed**`: MIT slew cap (try 2.5–4.0; 6 is fast but needs chunk + smoothing).
-- `**--infer-stride 8**`: re-plan more often (less smooth, more reactive).
-- `**--control-mode legacy**`: old one-query-per-tick behavior (debug only).
-- `**--ramp-from-feedback**`: only if needed (can oscillate).
-- `**--negate-a12-indices 1**`: test sign flip for left joint motor 3 if inverted.
+`--use-usb-camera-ports` is on by default on Linux; it reads `record/camera_ports.json` so inference sees the same head / left / right views as training.
+
+Useful flags:
+
+- `--control-mode chunk` (default): run the 16-step horizon before re-inferring.
+- `--rate-hz 30`: match record (`--teleop-rate 30`, `--dt 0.0333333`) and convert (`--fps 30`).
+- `--policy-ramp-max-speed`: MIT slew cap (try 2.0–2.5 for smoother arms).
+- `--chunk-blend-steps 12`: soften replan boundaries.
+- `--preview-cameras` on `record_episodes_3cam.py` or `preview_three_cameras.py` if views look swapped mid-session.
+- `--no-use-usb-camera-ports --video-cam-head …` only for legacy numeric overrides.
 
 Real-robot validation checklist:
 
-- Start with small-speed ramp and clear workspace.
-- Confirm `qpos` is stable (no frequent all-zero reads).
-- Verify first motion direction and joint limits before full task rollout.
-- Keep task text exactly aligned with training text.
+- `preview_three_cameras.py` labels match physical cameras.
+- Task string matches `meta/tasks.jsonl` / training text exactly.
+- Follower at home pose (~0 rad); `qpos` stable in logs (no periodic garbage reads).
+- Start with low `--policy-ramp-max-speed` and clear workspace before full task rollout.
 
 ---
 
@@ -364,12 +425,12 @@ uv run python scripts/deployment/benchmark_inference.py
 
 ## End-to-end quick checklist
 
-1. Record demos at **30 Hz / 30 fps** (`--teleop-rate 30`, `--dt 0.0333333`, `--qpos-median-samples 2`), correct camera IDs, and consistent task text.
-2. Visualize raw episodes and remove bad captures.
-3. Convert raw -> LeRobot -> v2.1 with `--fps 30` and restore `meta/modality.json`.
-4. Generate stats with `record/custom_3cam_config.py`.
-5. Fine-tune to `"${FT_OUT}"`.
-6. Run open-loop eval with `--model-path "${CKPT}"`.
-7. Start GR00T server with `--model-path "${CKPT}"`.
-8. Validate closed-loop on robot with `record/policy_client_3cam.py` at `--rate-hz 30`.
+1. Verify cameras: `uv run python record/preview_three_cameras.py` (HEAD / LEFT WRIST / RIGHT WRIST correct via `record/camera_ports.json`).
+2. Record demos at **30 Hz / 30 fps** (`--teleop-rate 30`, `--dt 0.0333333`, `--use-usb-camera-ports`, consistent task text).
+3. Visualize raw episodes (`visualize_recorded_episodes.py`); remove bad captures.
+4. Convert raw → LeRobot → v2.1 with `--fps 30`; restore `meta/modality.json`.
+5. Generate stats with `record/custom_3cam_config.py`.
+6. Fine-tune to `"${FT_OUT}"`; pick a checkpoint in `"${CKPT}"`.
+7. Open-loop eval: `open_loop_eval.py` with `--model-path "${CKPT}"`.
+8. Preview cameras again, start server (`run_gr00t_server.py`), then closed-loop `policy_client_3cam.py` with `--use-usb-camera-ports` and `--rate-hz 30`.
 

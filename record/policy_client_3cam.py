@@ -15,15 +15,15 @@ Example:
     --robot demo \\
     --rate-hz 5 --max-steps 100
 
-With USB cameras (indices like record_episodes_3cam):
+With USB cameras (stable USB ports via record/camera_ports.json on Linux):
   uv run python record/policy_client_3cam.py \\
     --robot usb_cam \\
-    --video-cam-head 4 --video-cam-left-wrist 0 --video-cam-right-wrist 8
+    --list-cameras-working   # optional: verify ports
 
 RobStride follower command (same CAN layout as direct_teleop / record direct_teleop mode):
   uv run python record/policy_client_3cam.py \\
     --robot robstride \\
-    --video-cam-head 4 --video-cam-left-wrist 0 --video-cam-right-wrist 8 \\
+    --use-usb-camera-ports \\
     --task "..." --apply-actions --dry-run-robstride  # omit dry-run on real hardware
 
 Control notes:
@@ -258,6 +258,19 @@ def _import_record_interfaces():
     spec = importlib.util.spec_from_file_location("record_episodes_3cam", rec)
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load {rec}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _import_usb_cameras():
+    """Lazy import shared USB camera port pinning (record/usb_cameras.py)."""
+    import importlib.util
+
+    path = _REPO_ROOT / "record" / "usb_cameras.py"
+    spec = importlib.util.spec_from_file_location("usb_cameras", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load {path}")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -545,9 +558,8 @@ def main() -> None:
         help="Legacy one-line logs (first 4 joints + grippers only).",
     )
     p.add_argument("--robot", choices=["demo", "usb_cam", "robstride"], default="demo")
-    p.add_argument("--video-cam-head", type=int, default=4)
-    p.add_argument("--video-cam-left-wrist", type=int, default=0)
-    p.add_argument("--video-cam-right-wrist", type=int, default=8)
+    _usb_cameras = _import_usb_cameras()
+    _usb_cameras.add_three_camera_cli_args(p)
     p.add_argument("--image-height", type=int, default=640)
     p.add_argument("--image-width", type=int, default=640)
     p.add_argument("--apply-actions", action="store_true", help="Send decoded targets to RobStride (robstride only)")
@@ -596,7 +608,10 @@ def main() -> None:
         help="Upper bound (rad) for the pre-inference follower zero-pose check. Default: +0.2",
     )
     args = p.parse_args()
+    if _usb_cameras.handle_camera_list_flags(args):
+        return
 
+    ramp_for_defaults = 6.0 if args.policy_ramp_max_speed == 0 else float(args.policy_ramp_max_speed)
     image_shape = (args.image_height, args.image_width)
     rec = _import_record_interfaces()
     robot: Any = None
@@ -605,19 +620,17 @@ def main() -> None:
     if args.robot == "demo":
         robot = rec.DemoRobotInterface(state_dim=12, action_dim=12, image_shape=image_shape)
     elif args.robot == "usb_cam":
+        camera_devices = _usb_cameras.camera_cli_from_args(args)
         robot = rec.USBVideoRobotInterface(
-            cam_head_device=args.video_cam_head,
-            cam_left_wrist_device=args.video_cam_left_wrist,
-            cam_right_wrist_device=args.video_cam_right_wrist,
+            camera_devices=camera_devices,
             state_dim=12,
             action_dim=12,
             image_shape=image_shape,
         )
     else:
+        camera_devices = _usb_cameras.camera_cli_from_args(args)
         robot = rec.USBVideoRobotInterface(
-            cam_head_device=args.video_cam_head,
-            cam_left_wrist_device=args.video_cam_left_wrist,
-            cam_right_wrist_device=args.video_cam_right_wrist,
+            camera_devices=camera_devices,
             state_dim=12,
             action_dim=12,
             image_shape=image_shape,

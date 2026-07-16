@@ -135,23 +135,23 @@ class QposReadSanitizer:
 
 
 def test_cameras(max_index: int, image_shape: tuple[int, int], warmup: int = 12, black_threshold: float = 5.0) -> None:
-    """Probe video indices and report which return non-black frames."""
-    try:
-        import cv2
-    except ImportError as exc:
-        raise ImportError("opencv-python is required for --test-cameras") from exc
+    """Probe video indices and report which return non-black frames (legacy numeric scan)."""
+    from usb_cameras import open_capture, print_working_cameras
+
+    if max_index <= 0:
+        print_working_cameras()
+        return
 
     h, w = image_shape
     working = []
     for i in range(max_index):
         path = f"/dev/video{i}"
-        cap = cv2.VideoCapture(path, getattr(cv2, "CAP_V4L2", 200))
-        if not cap.isOpened():
-            cap.release()
-            cap = cv2.VideoCapture(path)
+        cap = open_capture(path)
         if not cap.isOpened():
             print(f"{path}: not opened")
             continue
+        import cv2
+
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
         mean_val = 0.0
@@ -168,6 +168,7 @@ def test_cameras(max_index: int, image_shape: tuple[int, int], warmup: int = 12,
         else:
             print(f"{path}: black/no frames (mean {mean_val:.1f})")
     print(f"\nWorking indices: {working}")
+    print("Tip: use --list-cameras / --list-cameras-working for stable USB port IDs.")
 
 
 class RobotInterface:
@@ -230,45 +231,19 @@ class USBVideoRobotInterface(RobotInterface):
 
     def __init__(
         self,
-        cam_head_device: int | str,
-        cam_left_wrist_device: int | str,
-        cam_right_wrist_device: int | str,
+        camera_devices: dict[str, int | str],
         state_dim: int = 12,
         action_dim: int = 12,
         image_shape: tuple[int, int] = (240, 424),
     ):
-        try:
-            import cv2
-        except ImportError as exc:
-            raise ImportError("opencv-python is required for USB camera mode") from exc
+        from usb_cameras import USBCameraRig
 
-        self._cv2 = cv2
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.image_shape = image_shape
         self._qpos = np.zeros(self.state_dim, dtype=np.float32)
         self._action = np.zeros(self.action_dim, dtype=np.float32)
-
-        device_map: dict[str, int | str] = {
-            "cam_head": cam_head_device,
-            "cam_left_wrist": cam_left_wrist_device,
-            "cam_right_wrist": cam_right_wrist_device,
-        }
-        self._caps = {}
-        for cam_name, dev in device_map.items():
-            path = f"/dev/video{dev}" if isinstance(dev, int) else str(dev)
-            cap = cv2.VideoCapture(path, getattr(cv2, "CAP_V4L2", 200))
-            if not cap.isOpened():
-                cap.release()
-                cap = cv2.VideoCapture(path)
-            if not cap.isOpened():
-                raise RuntimeError(f"Failed to open camera {cam_name} at {path}")
-            h, w = image_shape
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            self._caps[cam_name] = cap
-            time.sleep(0.2)
+        self._camera_rig = USBCameraRig(camera_devices, image_shape)
 
     def set_state_action(self, qpos: np.ndarray | None = None, action: np.ndarray | None = None) -> None:
         if qpos is not None:
@@ -279,19 +254,7 @@ class USBVideoRobotInterface(RobotInterface):
             self._action[:] = a[: self.action_dim]
 
     def get_observation(self) -> dict[str, Any]:
-        cv2 = self._cv2
-        h, w = self.image_shape
-        images = {}
-        for cam in CAMERA_NAMES:
-            ret, frame = self._caps[cam].read()
-            if not ret or frame is None:
-                img = np.zeros((h, w, 3), dtype=np.uint8)
-            else:
-                if frame.shape[:2] != (h, w):
-                    frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_LINEAR)
-                img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            images[cam] = img.astype(np.uint8)
-
+        images = self._camera_rig.read_all_rgb(CAMERA_NAMES)
         return {
             "images": images,
             "qpos": self._qpos.copy(),
@@ -303,8 +266,7 @@ class USBVideoRobotInterface(RobotInterface):
         return self._action.copy()
 
     def close(self) -> None:
-        for cap in self._caps.values():
-            cap.release()
+        self._camera_rig.close()
 
 
 class DirectTeleopRobotInterface(USBVideoRobotInterface):
@@ -326,9 +288,7 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
 
     def __init__(
         self,
-        cam_head_device: int | str,
-        cam_left_wrist_device: int | str,
-        cam_right_wrist_device: int | str,
+        camera_devices: dict[str, int | str],
         leader_port: str = "/dev/ttyACM0",
         leader_baud: int = 57600,
         control_rate: float = 10.0,
@@ -338,9 +298,7 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
         image_shape: tuple[int, int] = (240, 424),
     ):
         super().__init__(
-            cam_head_device=cam_head_device,
-            cam_left_wrist_device=cam_left_wrist_device,
-            cam_right_wrist_device=cam_right_wrist_device,
+            camera_devices=camera_devices,
             state_dim=12,
             action_dim=12,
             image_shape=image_shape,
@@ -842,7 +800,10 @@ def record_episode(
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Record 3-camera episodes for GR00T-compatible conversion")
-    p.add_argument("--output-dir", type=Path, required=True)
+    from usb_cameras import add_three_camera_cli_args
+
+    add_three_camera_cli_args(p)
+    p.add_argument("--output-dir", type=Path, default=None)
     p.add_argument("--task", type=str, default="demo task")
     p.add_argument("--max-steps", type=int, default=5000)
     p.add_argument("--dt", type=float, default=1.0 / 30.0)
@@ -851,9 +812,6 @@ def main() -> None:
     p.add_argument("--image-height", type=int, default=640)
     p.add_argument("--image-width", type=int, default=640)
     p.add_argument("--robot", choices=["demo", "usb_cam", "direct_teleop"], default="demo")
-    p.add_argument("--video-cam-head", type=int, default=4)
-    p.add_argument("--video-cam-left-wrist", type=int, default=0)
-    p.add_argument("--video-cam-right-wrist", type=int, default=8)
     p.add_argument("--leader-port", type=str, default="/dev/ttyACM0")
     p.add_argument("--leader-baud", type=int, default=57600)
     p.add_argument("--teleop-rate", type=float, default=10.0)
@@ -877,6 +835,14 @@ def main() -> None:
     p.add_argument("--test-cameras-max", type=int, default=12)
     args = p.parse_args()
 
+    from usb_cameras import camera_cli_from_args, handle_camera_list_flags
+
+    if handle_camera_list_flags(args):
+        return
+
+    if args.output_dir is None:
+        p.error("--output-dir is required (unless using --list-cameras / --preview-cameras)")
+
     if args.test_cameras:
         test_cameras(
             max_index=args.test_cameras_max,
@@ -891,20 +857,18 @@ def main() -> None:
             image_shape=(args.image_height, args.image_width),
         )
     elif args.robot == "usb_cam":
+        camera_devices = camera_cli_from_args(args)
         robot = USBVideoRobotInterface(
-            cam_head_device=args.video_cam_head,
-            cam_left_wrist_device=args.video_cam_left_wrist,
-            cam_right_wrist_device=args.video_cam_right_wrist,
+            camera_devices=camera_devices,
             state_dim=args.state_dim,
             action_dim=args.action_dim,
             image_shape=(args.image_height, args.image_width),
         )
     else:
         try:
+            camera_devices = camera_cli_from_args(args)
             robot = DirectTeleopRobotInterface(
-                cam_head_device=args.video_cam_head,
-                cam_left_wrist_device=args.video_cam_left_wrist,
-                cam_right_wrist_device=args.video_cam_right_wrist,
+                camera_devices=camera_devices,
                 leader_port=args.leader_port,
                 leader_baud=args.leader_baud,
                 control_rate=args.teleop_rate,

@@ -33,6 +33,19 @@ import numpy as np
 # Must match record/record_episodes_3cam.py
 CAMERA_NAMES = ("cam_head", "cam_left_wrist", "cam_right_wrist")
 
+CAMERA_DISPLAY_LABELS: dict[str, str] = {
+    "cam_head": "HEAD",
+    "cam_left_wrist": "LEFT WRIST",
+    "cam_right_wrist": "RIGHT WRIST",
+}
+
+# Banner colors (RGB) — same roles as record/usb_cameras.py preview
+CAMERA_BANNER_RGB: dict[str, tuple[int, int, int]] = {
+    "cam_head": (40, 160, 40),
+    "cam_left_wrist": (30, 100, 180),
+    "cam_right_wrist": (200, 90, 30),
+}
+
 # Default humanoid 12-DoF naming (5+1 per arm); falls back to j0.. for other dims
 _DEFAULT_JOINT_LABELS_12 = (
     "L0",
@@ -239,6 +252,31 @@ def load_episode(path: Path) -> dict:
     return {"task": task, "fps": fps, "qpos": qpos, "action": action, "images": imgs, "length": t}
 
 
+def _annotate_camera_tile_rgb(tile: np.ndarray, cam: str) -> np.ndarray:
+    """Draw a colored HEAD / LEFT WRIST / RIGHT WRIST banner on one camera tile."""
+    import cv2
+
+    label = CAMERA_DISPLAY_LABELS.get(cam, cam)
+    banner_rgb = CAMERA_BANNER_RGB.get(cam, (80, 80, 80))
+    out = np.asarray(tile, dtype=np.uint8).copy()
+    h, w = out.shape[:2]
+    bar_h = max(28, h // 10)
+    bgr = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+    banner_bgr = (banner_rgb[2], banner_rgb[1], banner_rgb[0])
+    cv2.rectangle(bgr, (0, 0), (w, bar_h), banner_bgr, thickness=-1)
+    cv2.putText(
+        bgr,
+        label,
+        (8, bar_h - 8),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+
 def build_rgb_strip_tiles(
     images: dict[str, np.ndarray],
     frame_idx: int,
@@ -254,7 +292,8 @@ def build_rgb_strip_tiles(
             raise ValueError(f"Bad image shape for {cam}: {img.shape}")
         h, w = img.shape[:2]
         new_w = int(w * (target_h / h))
-        tiles.append(cv2.resize(img, (new_w, target_h), interpolation=cv2.INTER_AREA))
+        resized = cv2.resize(img, (new_w, target_h), interpolation=cv2.INTER_AREA)
+        tiles.append(_annotate_camera_tile_rgb(resized, cam))
     return np.concatenate(tiles, axis=1)
 
 
