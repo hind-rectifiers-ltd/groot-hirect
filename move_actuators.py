@@ -1,34 +1,44 @@
 """
-Independent module: drive 12 RobStride follower arm joints from a position vector.
+Independent module: drive 16 RobStride follower arm joints from a position vector.
 
 This file has no dependency on any other file in this repo.  It can be imported
 from any script.
 
+Each arm is 7 revolute joints + 1 gripper (7 + 1 DoF), matching the humanoid
+URDF.  Per-arm joint order:
+
+    shoulder_pitch, shoulder_roll, shoulder_yaw, elbow_roll,
+    wrist_pitch, wrist_roll, wrist_yaw, gripper
+
 Joint vector order (radians):
-  [0..5]  left arm  — CAN ``can1``, motor IDs 1, 3, 5, 7, 9, 11
-  [6..11] right arm — CAN ``can0``, motor IDs 2, 4, 6, 8, 10, 12
+  [0..7]   left arm  — CAN ``can1``, motor IDs 1, 3, 5, 7, 9, 11, 13, 15
+  [8..15]  right arm — CAN ``can0``, motor IDs 2, 4, 6, 8, 10, 12, 14, 16
+
+The two wrist motors added per arm (wrist_roll / wrist_yaw) reuse the rs-02
+model and the same tuning (kp / kd / torque limit) as motors 9 and 10. The
+gripper is the last motor in each chain (ID 15 left, ID 16 right).
 
 Typical use::
 
     from move_actuators import ActuatorController
     import numpy as np
 
-    targets = np.zeros(12)
-    targets[2] = 0.5   # left joint 2
-    targets[9] = -0.3  # right joint 3
+    targets = np.zeros(16)
+    targets[2] = 0.5   # left shoulder_yaw
+    targets[12] = -0.3 # right shoulder_yaw
 
     with ActuatorController() as arm:
         # inside a control loop:
-        sent = arm.command_joints12(targets)
+        sent = arm.command_joints(targets)
 
 One-shot helper (connects → sends → disconnects)::
 
-    from move_actuators import command_joints12
-    command_joints12([0.0] * 12)
+    from move_actuators import command_joints
+    command_joints([0.0] * 16)
 
 CLI::
 
-    uv run python move_actuators.py --joints 0,0,0,0,0,0,0,0,0,0,0,0
+    uv run python move_actuators.py --joints 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
 """
 
 from __future__ import annotations
@@ -47,39 +57,81 @@ import numpy as np
 # Hardware constants (same values as direct_teleop.py)
 # ---------------------------------------------------------------------------
 
-LEFT_ROBSTRIDE_IDS: list[int] = [1, 3, 5, 7, 9, 11]
-RIGHT_ROBSTRIDE_IDS: list[int] = [2, 4, 6, 8, 10, 12]
+# Per-arm joint order: shoulder_pitch, shoulder_roll, shoulder_yaw, elbow_roll,
+#                      wrist_pitch, wrist_roll, wrist_yaw, gripper
+# IDs 11/13 (left) and 12/14 (right) are the new wrist_roll / wrist_yaw motors.
+# Grippers are the last motor in each chain: ID 15 (left), ID 16 (right).
+# If you flashed motors with different CAN IDs, edit the two lists below.
+LEFT_ROBSTRIDE_IDS: list[int] = [1, 3, 5, 7, 9, 11, 13, 15]
+RIGHT_ROBSTRIDE_IDS: list[int] = [2, 4, 6, 8, 10, 12, 14, 16]
 LEFT_CAN = "can1"
 RIGHT_CAN = "can0"
 
 MOTOR_MODEL_MAP: dict[int, str] = {
     1: "rs-03", 2: "rs-03", 3: "rs-03", 4: "rs-03",
     5: "rs-06", 6: "rs-06", 7: "rs-06", 8: "rs-06",
-    9: "rs-02", 10: "rs-02", 11: "rs-02", 12: "rs-02",
+    9: "rs-02", 10: "rs-02",                      # wrist_pitch
+    11: "rs-02", 12: "rs-02", 13: "rs-02", 14: "rs-02",  # wrist_roll / wrist_yaw
+    15: "rs-02", 16: "rs-02",                     # grippers
 }
 MOTOR_KP: dict[int, float] = {
     1: 180.0, 2: 180.0, 3: 180.0, 4: 180.0, 5: 100.0, 6: 100.0,
-    7: 180.0, 8: 180.0, 9: 30.0,  10: 30.0, 11: 30.0, 12: 30.0,
+    7: 180.0, 8: 180.0, 9: 30.0,  10: 30.0,
+    11: 30.0, 12: 30.0, 13: 30.0, 14: 30.0,       # wrist_roll / wrist_yaw (as 9/10)
+    15: 30.0, 16: 30.0,                            # grippers
 }
 MOTOR_KD: dict[int, float] = {
     1: 50.0, 2: 50.0, 3: 50.0, 4: 50.0, 5: 18.0, 6: 18.0,
-    7: 50.0, 8: 50.0, 9: 18.0, 10: 18.0, 11: 30.0, 12: 30.0,
+    7: 50.0, 8: 50.0, 9: 18.0, 10: 18.0,
+    11: 18.0, 12: 18.0, 13: 18.0, 14: 18.0,       # wrist_roll / wrist_yaw (as 9/10)
+    15: 30.0, 16: 30.0,                            # grippers
 }
 MOTOR_TORQUE_LIMIT: dict[int, float] = {
     1: 12.0, 2: 12.0, 3: 12.0, 4: 12.0, 5: 12.0, 6: 12.0,
-    7: 12.0, 8: 12.0, 9: 8.0,  10: 8.0,  11: 8.0, 12: 8.0,
+    7: 12.0, 8: 12.0, 9: 8.0,  10: 8.0,
+    11: 8.0, 12: 8.0, 13: 8.0, 14: 8.0,
+    15: 8.0, 16: 8.0,                              # grippers
 }
+
+# Per-motor rotation sign, applied symmetrically to both commands (write) and
+# encoder reads. Use -1.0 when a motor is mounted opposite the URDF / IK joint
+# convention so a positive joint angle drives the joint the correct way.
+#
+# This is applied inside move_actuators (not the driver calibration) because the
+# encoder is read via bus.read(MECHANICAL_POSITION), which does NOT apply the
+# driver's direction calibration; doing it here keeps write and read in the same
+# logical frame (so the safety delta check stays correct).
+#
+# Motor 8 = right arm elbow_roll (RIGHT_ROBSTRIDE_IDS index 3).
+MOTOR_DIRECTION: dict[int, float] = {
+    1: 1.0, 2: 1.0, 3: -1.0, 4: 1.0, 5: 1.0, 6: 1.0, 7: -1.0,
+    8: 1.0,                                        # right elbow_roll (inverted mounting)
+    9: 1.0, 10: 1.0, 11: -1.0, 12: -1.0, 13: 1.0, 14: 1.0,
+    15: -1.0, 16: 1.0,
+}
+
+# Per-motor "software zero": the joint angle (rad, logical frame) the motor sits
+# at when it reads its mechanical zero. RobStride absolute encoders have a known
+# glitch where a motor truly at angle θ intermittently reports θ ± 2π (e.g. a
+# joint at 0 reads ~6.28). Every revolute joint here travels < π from its zero
+# (largest range is the elbow at -2.30 rad), so any reading more than π away
+# from the software zero can only be that wrap glitch. ``_normalize_near_zero``
+# folds such readings back into the ±π window around the zero, removing the
+# glitch unambiguously. Set a non-zero value here only if a joint's mechanical
+# zero is offset from its logical zero.
+MOTOR_SOFTWARE_ZERO: dict[int, float] = {mid: 0.0 for mid in range(1, 17)}
 
 RAMP_MAX_SPEED_RAD_S = 6.0   # rad/s slew limit (per joint, per second)
 RAMP_DT_MAX_S = 0.1          # cap on dt used for ramp step calculation
 
 # Command safety: compare targets to live encoder reads in the motor's native frame.
 # Uses per-step delta limits (not abs(angle) > pi) so wrapped encoders near 2*pi do not false-trip.
-SAFETY_MAX_DELTA_RAD = 1.5           # max |ramped target - encoder| per command tick
+SAFETY_MAX_DELTA_RAD = 1.0           # max |ramped target - encoder| per command tick
 SAFETY_MAX_INITIAL_DELTA_RAD = 1.0   # stricter limit on the first command after connect
-SAFETY_EXCLUDED_MOTOR_IDS: tuple[int, ...] = (11, 12)  # grippers
+SAFETY_EXCLUDED_MOTOR_IDS: tuple[int, ...] = (15, 16)  # grippers
 
-NUM_JOINTS = 12
+ARM_DOF = len(LEFT_ROBSTRIDE_IDS)              # joints per arm (7 revolute + gripper = 8)
+NUM_JOINTS = len(LEFT_ROBSTRIDE_IDS) + len(RIGHT_ROBSTRIDE_IDS)
 JOINT_MOTOR_IDS: list[int] = LEFT_ROBSTRIDE_IDS + RIGHT_ROBSTRIDE_IDS
 
 
@@ -154,6 +206,17 @@ def _shortest_delta_rad(to_angle: float, from_angle: float) -> float:
     return (d + np.pi) % (2.0 * np.pi) - np.pi
 
 
+def _normalize_near_zero(value: float, zero: float = 0.0) -> float:
+    """Collapse RobStride ~2π encoder-wrap glitches around a software zero.
+
+    Maps ``value`` to the equivalent angle within ±π of ``zero``, so a motor
+    physically at ``zero`` that spuriously reports ``zero ± 2π`` reads back as
+    ``zero``. Safe because every revolute joint here travels less than π from
+    its zero, so the ±π window contains exactly one valid representative.
+    """
+    return float(zero) + _shortest_delta_rad(value, zero)
+
+
 def _ramp_toward(current: float, desired: float, max_step: float) -> float:
     """Step toward ``desired`` along the shortest angular path (handles ~2π encoder wraps)."""
     err = _shortest_delta_rad(desired, current)
@@ -179,12 +242,12 @@ class ActuatorController:
     """
     Persistent connection to the two RobStride CAN buses.
 
-    Open once, call ``command_joints12`` as fast as your loop runs,
+    Open once, call ``command_joints`` as fast as your loop runs,
     close when done.  Safe to use as a context manager::
 
         with ActuatorController() as arm:
             for targets in trajectory:
-                arm.command_joints12(targets)
+                arm.command_joints(targets)
     """
 
     def __init__(
@@ -236,8 +299,8 @@ class ActuatorController:
         self._connected = False
 
         # Read stats — useful when MIT writes and register reads compete for the bus.
-        self._read_calls = 0       # number of times read_joints12() was invoked
-        self._read_attempts = 0    # per-joint attempts (12 per call when both buses are live)
+        self._read_calls = 0       # number of times read_joints() was invoked
+        self._read_attempts = 0    # per-joint attempts (16 per call when both buses are live)
         self._read_failures = 0    # per-joint failures (left at 0.0)
         self._rx_frames_drained = 0  # cumulative stale frames flushed before reads
 
@@ -297,7 +360,7 @@ class ActuatorController:
         self._connected = False
 
     def _joint_bus_live(self, joint_index: int) -> bool:
-        if joint_index < 6:
+        if joint_index < ARM_DOF:
             return self._left_bus is not None and len(self._left_motors) > 0
         return self._right_bus is not None and len(self._right_motors) > 0
 
@@ -335,7 +398,7 @@ class ActuatorController:
         if feedback12 is not None:
             current = _pad12(feedback12)
         else:
-            current = self.read_joints12()
+            current = self.read_joints()
         breaches: list[tuple[int, float, float, float]] = []
         for i in range(NUM_JOINTS):
             if not self._joint_bus_live(i):
@@ -386,7 +449,7 @@ class ActuatorController:
     # Commanding
     # ------------------------------------------------------------------
 
-    def command_joints12(
+    def command_joints(
         self,
         angles12: np.ndarray | list | tuple,
         *,
@@ -394,17 +457,19 @@ class ActuatorController:
         feedback12: np.ndarray | list | tuple | None = None,
     ) -> np.ndarray:
         """
-        Send MIT position targets to all 12 joints.
+        Send MIT position targets to all 16 joints.
 
         Args:
-            angles12: Target joint angles in radians.  Length must be 12.
-                      Order: [L0, L1, L2, L3, L4, Lg, R0, R1, R2, R3, R4, Rg].
+            angles12: Target joint angles in radians.  Length must be 16.
+                      Order: [L0..L6, Lg, R0..R6, Rg] where 0..6 are
+                      shoulder_pitch, shoulder_roll, shoulder_yaw, elbow_roll,
+                      wrist_pitch, wrist_roll, wrist_yaw.
             ramp: Override the instance-level ramp setting for this call only.
             feedback12: Optional encoder-frame qpos from the same tick (see
                         :meth:`_enforce_command_safety`).
 
         Returns:
-            The 12 targets actually written to the motors (after ramp limiting).
+            The 16 targets actually written to the motors (after ramp limiting).
 
         Raises:
             RuntimeError: if not connected.
@@ -435,10 +500,10 @@ class ActuatorController:
             sent[i] = target
 
         for i, (name, _mid) in enumerate(self._right_motors):
-            desired = float(q[6 + i])
+            desired = float(q[ARM_DOF + i])
             target = _ramp_toward(self._ramped.get(name, desired), desired, max_step)
             self._ramped[name] = target
-            sent[6 + i] = target
+            sent[ARM_DOF + i] = target
 
         # Safety applies to ramp-limited targets actually sent, not the full policy horizon.
         self._enforce_command_safety(sent, feedback12=feedback12)
@@ -447,7 +512,8 @@ class ActuatorController:
             if self._left_bus:
                 try:
                     self._left_bus.write_operation_frame(
-                        name, sent[i], MOTOR_KP[mid], MOTOR_KD[mid], 0.0, 0.0
+                        name, sent[i] * MOTOR_DIRECTION.get(mid, 1.0),
+                        MOTOR_KP[mid], MOTOR_KD[mid], 0.0, 0.0
                     )
                 except Exception:
                     pass
@@ -456,31 +522,35 @@ class ActuatorController:
             if self._right_bus:
                 try:
                     self._right_bus.write_operation_frame(
-                        name, sent[6 + i], MOTOR_KP[mid], MOTOR_KD[mid], 0.0, 0.0
+                        name, sent[ARM_DOF + i] * MOTOR_DIRECTION.get(mid, 1.0),
+                        MOTOR_KP[mid], MOTOR_KD[mid], 0.0, 0.0
                     )
                 except Exception:
                     pass
 
         return sent
 
+    # Backward-compatible alias (this controller now spans 16 joints, not 12).
+    command_joints12 = command_joints
+
     def seed_ramp_from_angles(self, angles12: np.ndarray | list | tuple) -> None:
         """
         Pre-load the internal ramp state with the given joint angles.
 
-        After calling this, the next ``command_joints12`` will ramp *from* these
+        After calling this, the next ``command_joints`` will ramp *from* these
         angles toward the requested target instead of snapping straight to it.
         Typical use: read current encoder positions and call this before the
         first command of an inference / playback loop so the arm does not jerk
         from a stale (or zero) ramp seed.
 
         Args:
-            angles12: 12-vector of seed angles, ordered like ``command_joints12``.
+            angles12: 16-vector of seed angles, ordered like ``command_joints``.
         """
         q = _pad12(angles12)
         for i, (name, _mid) in enumerate(self._left_motors):
             self._ramped[name] = float(q[i])
         for i, (name, _mid) in enumerate(self._right_motors):
-            self._ramped[name] = float(q[6 + i])
+            self._ramped[name] = float(q[ARM_DOF + i])
         self._last_cmd_t = None
 
     # ------------------------------------------------------------------
@@ -559,14 +629,15 @@ class ActuatorController:
         *,
         drain_rx: bool,
     ) -> np.ndarray:
-        """Read one arm half (6 joints) from a single CAN bus."""
+        """Read one arm half (8 joints) from a single CAN bus."""
         out = np.zeros(len(motors), dtype=np.float64)
         if bus is None or not motors:
             return out
         if drain_rx:
             self._drain_bus_rx(bus)
-        for i, (name, _) in enumerate(motors):
-            out[i] = self._read_one_with_retry(bus, name)
+        for i, (name, mid) in enumerate(motors):
+            raw = self._read_one_with_retry(bus, name) * MOTOR_DIRECTION.get(mid, 1.0)
+            out[i] = _normalize_near_zero(raw, MOTOR_SOFTWARE_ZERO.get(mid, 0.0))
         return out
 
     def _read_one_with_retry(self, bus, name: str, *, max_retries: int | None = None) -> float:
@@ -604,14 +675,14 @@ class ActuatorController:
         _ = last_exc  # kept for future debugging
         return 0.0
 
-    def read_joints12(self, *, drain_rx: bool = True) -> np.ndarray:
+    def read_joints(self, *, drain_rx: bool = True) -> np.ndarray:
         """
-        Read MECHANICAL_POSITION for all 12 joints.  Failed reads stay 0.0.
+        Read MECHANICAL_POSITION for all 16 joints.  Failed reads stay 0.0.
 
         Args:
             drain_rx: If True (default), flush stale frames from each bus's RX queue
                       before issuing register reads.  Strongly recommended when called
-                      after ``command_joints12`` on the same bus.
+                      after ``command_joints`` on the same bus.
         """
         if not self._connected:
             raise RuntimeError("[move_actuators] Not connected.")
@@ -642,19 +713,22 @@ class ActuatorController:
                 )
                 left = f_left.result()
                 right = f_right.result()
-            out[:6] = left
-            out[6:] = right
+            out[:ARM_DOF] = left
+            out[ARM_DOF:] = right
         else:
             if self._left_bus is not None:
-                out[:6] = self._read_bus_joints(
+                out[:ARM_DOF] = self._read_bus_joints(
                     self._left_bus, self._left_motors, drain_rx=drain_rx
                 )
             if self._right_bus is not None:
-                out[6:] = self._read_bus_joints(
+                out[ARM_DOF:] = self._read_bus_joints(
                     self._right_bus, self._right_motors, drain_rx=drain_rx
                 )
 
         return out
+
+    # Backward-compatible alias.
+    read_joints12 = read_joints
 
     def read_stats_line(self) -> str:
         """One-line summary of read reliability since connect()."""
@@ -670,7 +744,7 @@ class ActuatorController:
 # One-shot helper
 # ---------------------------------------------------------------------------
 
-def command_joints12(
+def command_joints(
     angles12: np.ndarray | list | tuple,
     *,
     ramp: bool = True,
@@ -678,7 +752,11 @@ def command_joints12(
 ) -> np.ndarray:
     """Connect, send one command, disconnect.  Use ``ActuatorController`` for loops."""
     with ActuatorController(ramp=ramp, ramp_max_speed_rad_s=ramp_max_speed_rad_s) as arm:
-        return arm.command_joints12(angles12)
+        return arm.command_joints(angles12)
+
+
+# Backward-compatible alias.
+command_joints12 = command_joints
 
 
 # ---------------------------------------------------------------------------
@@ -695,19 +773,22 @@ def _parse_joints12(s: str) -> np.ndarray:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Send a single 12-DoF joint command to the RobStride arms.")
+    p = argparse.ArgumentParser(description="Send a single 16-DoF joint command to the RobStride arms.")
     p.add_argument(
         "--joints", type=_parse_joints12, required=True,
-        metavar="q0,q1,...,q11",
-        help="12 comma-separated joint angles in radians (L0..Lg then R0..Rg).",
+        metavar="q0,q1,...,q15",
+        help="16 comma-separated joint angles in radians (L0..L6,Lg then R0..R6,Rg).",
     )
     p.add_argument("--no-ramp", action="store_true", help="Skip slew limiting (jump directly to targets).")
     p.add_argument("--hold-s", type=float, default=1.0, help="Hold position for this many seconds before exit.")
     args = p.parse_args()
 
     with ActuatorController(ramp=not args.no_ramp) as arm:
-        sent = arm.command_joints12(args.joints)
-        labels = ("L0", "L1", "L2", "L3", "L4", "Lg", "R0", "R1", "R2", "R3", "R4", "Rg")
+        sent = arm.command_joints(args.joints)
+        labels = (
+            "L0", "L1", "L2", "L3", "L4", "L5", "L6", "Lg",
+            "R0", "R1", "R2", "R3", "R4", "R5", "R6", "Rg",
+        )
         print("Commanded joints:")
         for j, (lab, v) in enumerate(zip(labels, sent)):
             print(f"  [{j:2d}] {lab}  {v:.4f} rad")

@@ -56,7 +56,7 @@ def main():
     try:
         # RobstrideBus.scan_channel 已经为我们实现了所有逻辑
         # 它内部使用了 tqdm 来显示进度条
-        found_motors = RobstrideBus.scan_channel(channel, start_id=1, end_id=13) # end_id=255 会扫描到 254
+        found_motors = RobstrideBus.scan_channel(channel, start_id=1, end_id=17) # end_id=255 会扫描到 254
     
     except Exception as e:
         print(f"\n❌ 扫描出错: {e}")

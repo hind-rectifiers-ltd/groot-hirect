@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Passive follower joint reader: poll MECHANICAL_POSITION on all 12 RobStride motors.
+Passive follower joint reader: poll MECHANICAL_POSITION on all 16 RobStride motors.
 
 No teleop, no MIT command stream, no ``follower_qpos_reader`` / MIT fallbacks — only
 register reads so you can move the arm by hand and confirm encoders track.
 
-CAN layout matches ``direct_teleop.py``: left ``can1`` ids 1,3,5,7,9,11 → indices 0..5;
-right ``can0`` ids 2,4,6,8,10,12 → indices 6..11.
+CAN layout matches ``move_actuators.py`` / ``direct_teleop.py`` (7+1 per arm):
+  left  ``can1`` ids 1,3,5,7,9,11,13,15 → indices 0..7
+  right ``can0`` ids 2,4,6,8,10,12,14,16 → indices 8..15
 
 Default: connect, enable briefly, then **disable** all motors so you can backdrive by hand.
 If reads fail after disable, try ``--keep-torque-enabled`` (motors may hold position).
@@ -25,28 +26,42 @@ from pathlib import Path
 
 import numpy as np
 
-# --- Same arm layout as direct_teleop.py (duplicated to avoid importing teleop) ---
-LEFT_ROBSTRIDE_IDS = [1, 3, 5, 7, 9, 11]
-RIGHT_ROBSTRIDE_IDS = [2, 4, 6, 8, 10, 12]
-LEFT_CAN = "can1"
-RIGHT_CAN = "can0"
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
 
-MOTOR_MODEL_MAP = {
-    1: "rs-03",
-    2: "rs-03",
-    3: "rs-03",
-    4: "rs-03",
-    5: "rs-06",
-    6: "rs-06",
-    7: "rs-06",
-    8: "rs-06",
-    9: "rs-02",
-    10: "rs-02",
-    11: "rs-02",
-    12: "rs-02",
-}
+from move_actuators import (  # noqa: E402
+    ARM_DOF,
+    LEFT_CAN,
+    LEFT_ROBSTRIDE_IDS,
+    MOTOR_DIRECTION,
+    MOTOR_MODEL_MAP,
+    MOTOR_SOFTWARE_ZERO,
+    NUM_JOINTS,
+    RIGHT_CAN,
+    RIGHT_ROBSTRIDE_IDS,
+    _normalize_near_zero,
+)
 
-_LABELS_12 = ("L0", "L1", "L2", "L3", "L4", "Lg", "R0", "R1", "R2", "R3", "R4", "Rg")
+# L0..L6 + Lg, R0..R6 + Rg  (L5/L6 = wrist_roll/yaw motors 11/13; R5/R6 = 12/14)
+_LABELS_16 = (
+    "L0",
+    "L1",
+    "L2",
+    "L3",
+    "L4",
+    "L5",
+    "L6",
+    "Lg",
+    "R0",
+    "R1",
+    "R2",
+    "R3",
+    "R4",
+    "R5",
+    "R6",
+    "Rg",
+)
 
 
 def _repo_root() -> Path:
@@ -54,7 +69,6 @@ def _repo_root() -> Path:
     p = Path(__file__).resolve().parent.parent
     if (p / "robstride_control").is_dir() or (p / "pyproject.toml").is_file():
         return p
-    # Fallback: parent of scripts
     return Path(__file__).resolve().parents[1]
 
 
@@ -72,7 +86,10 @@ def _open_bus(RobstrideBus, Motor, ParameterType, can_channel: str, motor_ids: l
     if not motor_ids:
         return None, []
     motor_names = [f"motor_{mid}" for mid in motor_ids]
-    motors_cfg = {name: Motor(id=mid, model=MOTOR_MODEL_MAP.get(mid, "rs-02")) for mid, name in zip(motor_ids, motor_names)}
+    motors_cfg = {
+        name: Motor(id=mid, model=MOTOR_MODEL_MAP.get(mid, "rs-02"))
+        for mid, name in zip(motor_ids, motor_names)
+    }
     calibration = {name: {"direction": 1, "homing_offset": 0.0} for name in motor_names}
     bus = RobstrideBus(can_channel, motors_cfg, calibration)
     bus.connect(handshake=True)
@@ -82,27 +99,37 @@ def _open_bus(RobstrideBus, Motor, ParameterType, can_channel: str, motor_ids: l
     return bus, list(zip(motor_names, motor_ids))
 
 
-def _read_mechanical_12(
+def _read_mechanical_16(
     left_bus,
     right_bus,
     left_motors: list[tuple[str, int]],
     right_motors: list[tuple[str, int]],
     parameter_type,
 ) -> np.ndarray:
-    """Single-shot MECHANICAL_POSITION only; failed joints stay 0.0 (no MIT / last-good)."""
-    out = np.zeros(12, dtype=np.float64)
-    for i, (name, _mid) in enumerate(left_motors):
+    """Single-shot MECHANICAL_POSITION; failed joints stay 0.0 (no MIT / last-good).
+
+    Applies the same ``MOTOR_DIRECTION`` + software-zero unwrap as ``move_actuators``
+    so printed values match teleop / ``ActuatorController.read_joints``.
+    """
+    out = np.zeros(NUM_JOINTS, dtype=np.float64)
+
+    def _one(bus, name: str, mid: int) -> float:
+        raw = float(bus.read(name, parameter_type.MECHANICAL_POSITION))
+        directed = raw * MOTOR_DIRECTION.get(mid, 1.0)
+        return _normalize_near_zero(directed, MOTOR_SOFTWARE_ZERO.get(mid, 0.0))
+
+    for i, (name, mid) in enumerate(left_motors):
         if left_bus is None:
             continue
         try:
-            out[i] = float(left_bus.read(name, parameter_type.MECHANICAL_POSITION))
+            out[i] = _one(left_bus, name, mid)
         except Exception:
             pass
-    for i, (name, _mid) in enumerate(right_motors):
+    for i, (name, mid) in enumerate(right_motors):
         if right_bus is None:
             continue
         try:
-            out[6 + i] = float(right_bus.read(name, parameter_type.MECHANICAL_POSITION))
+            out[ARM_DOF + i] = _one(right_bus, name, mid)
         except Exception:
             pass
     return out
@@ -125,7 +152,10 @@ def _disconnect(left_bus, left_motors, right_bus, right_motors) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="Read-only MECHANICAL_POSITION polling for 12 RobStride arm joints (no teleop / no MIT commands)."
+        description=(
+            f"Read-only MECHANICAL_POSITION polling for {NUM_JOINTS} RobStride arm joints "
+            "(7+1 per arm; no teleop / no MIT commands)."
+        )
     )
     p.add_argument("--rate-hz", type=float, default=15.0, help="Target loop rate (sleep-paced)")
     p.add_argument(
@@ -138,7 +168,7 @@ def main() -> None:
         "--format",
         choices=("line", "table", "csv"),
         default="line",
-        help="line: one array per sample; table: per-joint; csv: t,sample,q0..q11",
+        help=f"line: one array per sample; table: per-joint; csv: t,sample,q0..q{NUM_JOINTS - 1}",
     )
     p.add_argument("--print-every", type=int, default=1, help="Print every N samples")
     args = p.parse_args()
@@ -153,16 +183,27 @@ def main() -> None:
         from robstride_dynamics.protocol import ParameterType
 
     print(f"Repo root: {repo}", flush=True)
-    print(f"Opening {LEFT_CAN} (left) and {RIGHT_CAN} (right)...", flush=True)
+    print(
+        f"Opening {LEFT_CAN} left={LEFT_ROBSTRIDE_IDS} and "
+        f"{RIGHT_CAN} right={RIGHT_ROBSTRIDE_IDS} ({NUM_JOINTS} joints)...",
+        flush=True,
+    )
 
-    left_bus, left_motors = _open_bus(RobstrideBus, Motor, ParameterType, LEFT_CAN, LEFT_ROBSTRIDE_IDS)
-    right_bus, right_motors = _open_bus(RobstrideBus, Motor, ParameterType, RIGHT_CAN, RIGHT_ROBSTRIDE_IDS)
+    left_bus, left_motors = _open_bus(
+        RobstrideBus, Motor, ParameterType, LEFT_CAN, LEFT_ROBSTRIDE_IDS
+    )
+    right_bus, right_motors = _open_bus(
+        RobstrideBus, Motor, ParameterType, RIGHT_CAN, RIGHT_ROBSTRIDE_IDS
+    )
     if not left_bus and not right_bus:
         print("No buses connected.", file=sys.stderr)
         raise SystemExit(1)
 
     if not args.keep_torque_enabled:
-        print("Disabling motor torque for passive hand motion (use --keep-torque-enabled to skip).", flush=True)
+        print(
+            "Disabling motor torque for passive hand motion (use --keep-torque-enabled to skip).",
+            flush=True,
+        )
         for bus, motors in ((left_bus, left_motors), (right_bus, right_motors)):
             if bus is None:
                 continue
@@ -178,30 +219,39 @@ def main() -> None:
     pe = max(1, int(args.print_every))
 
     print(
-        f"Reading MECHANICAL_POSITION at ~{args.rate_hz} Hz (mechanical only). "
+        f"Reading MECHANICAL_POSITION at ~{args.rate_hz} Hz ({NUM_JOINTS}D). "
         "Move joints by hand; Ctrl+C to exit.",
         flush=True,
     )
     if args.format == "csv":
-        print("t_unix,sample," + ",".join(f"qpos_{j}_{_LABELS_12[j]}" for j in range(12)), flush=True)
+        header = "t_unix,sample," + ",".join(
+            f"qpos_{j}_{_LABELS_16[j]}" for j in range(NUM_JOINTS)
+        )
+        print(header, flush=True)
 
     n = 0
     try:
         while True:
             t0 = time.monotonic()
-            q = _read_mechanical_12(left_bus, right_bus, left_motors, right_motors, ParameterType)
+            q = _read_mechanical_16(
+                left_bus, right_bus, left_motors, right_motors, ParameterType
+            )
             n += 1
             if n % pe == 0:
                 if args.format == "line":
-                    inner = ", ".join(f"{float(q[j]):.{prec}f}" for j in range(12))
-                    print(f"[{n:6d}] qpos = np.array([{inner}])", flush=True)
+                    inner = ", ".join(f"{float(q[j]):.{prec}f}" for j in range(NUM_JOINTS))
+                    print(f"[{n:6d}] qpos = np.array([{inner}])  # len={NUM_JOINTS}", flush=True)
                 elif args.format == "table":
                     print(f"\n--- sample={n} t={time.time():.3f} ---", flush=True)
-                    for j in range(12):
-                        print(f"  [{j:2d}] {_LABELS_12[j]:4s}  {float(q[j]):.{prec}f}", flush=True)
+                    for j in range(NUM_JOINTS):
+                        mid = LEFT_ROBSTRIDE_IDS[j] if j < ARM_DOF else RIGHT_ROBSTRIDE_IDS[j - ARM_DOF]
+                        print(
+                            f"  [{j:2d}] {_LABELS_16[j]:4s}  id={mid:2d}  {float(q[j]):.{prec}f}",
+                            flush=True,
+                        )
                 else:
                     ts = time.time()
-                    row = [f"{ts:.6f}", str(n)] + [f"{float(q[j]):.6f}" for j in range(12)]
+                    row = [f"{ts:.6f}", str(n)] + [f"{float(q[j]):.6f}" for j in range(NUM_JOINTS)]
                     print(",".join(row), flush=True)
 
             elapsed = time.monotonic() - t0

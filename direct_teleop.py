@@ -9,8 +9,15 @@ Flow:
 - Read leader present positions from Dynamixel motors (raw units).
 - Use first sample as teleop zero (capture follower mechanical refs).
 - Accumulate shortest-path deltas in leader raw units.
-- Convert deltas to follower target radians and drive motors via ``ActuatorController``
-  from ``move_actuators``.
+- Map leader 5+1 per arm → follower 7+1 per arm (16D) and drive via
+  ``ActuatorController`` from ``move_actuators``.
+
+Leader vs follower layout (temporary until leader gets two more wrist servos):
+- Leader: 12 Dynamixels = 5 arm + 1 gripper per side.
+- Follower: 16 RobStride = 7 arm + 1 gripper per side
+  (IDs 1,3,5,7,9,11,13,15 left / 2,4,6,8,10,12,14,16 right).
+- Follower wrist_roll / wrist_yaw (motors 11,12,13,14) are commanded to **0**.
+- Follower grippers are motors 15 (left) and 16 (right).
 
 Optional: ``--print-follower-qpos`` uses ``record/follower_qpos_reader.py`` (retries,
 MIT status fallback, last-good per joint) like ``record/record_episodes_3cam.py``,
@@ -27,15 +34,25 @@ from pathlib import Path
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# Leader (Dynamixel) constants
+# Leader (Dynamixel) constants — still 5 arm + 1 gripper per side (12 total)
 # ---------------------------------------------------------------------------
 
 SERVO_UNITS_PER_REV = 4096.0
 RAD_PER_SERVO_UNIT = 2.0 * math.pi / SERVO_UNITS_PER_REV
 
-GRIPPER_MOTION_SCALE = 5.0
-GRIPPER_MOTOR_IDS = {11, 12}
-GRIPPER_SERVO_INDICES = {10, 11}
+# Leader Dynamixel → follower gripper gain. Left finger travel is short (~0.5 rad),
+# so use a lower scale than the right (still under separate testing).
+GRIPPER_MOTION_SCALE = 5.0          # default / right gripper
+LEFT_GRIPPER_MOTION_SCALE = 1.0     # left gripper only (motor 15 / leader servo 10)
+RIGHT_GRIPPER_MOTION_SCALE = GRIPPER_MOTION_SCALE
+# Leader Dynamixel indices for left/right grippers in the 12-vector pad order.
+LEFT_GRIPPER_SERVO_INDEX = 10
+RIGHT_GRIPPER_SERVO_INDEX = 11
+GRIPPER_SERVO_INDICES = {LEFT_GRIPPER_SERVO_INDEX, RIGHT_GRIPPER_SERVO_INDEX}
+LEADER_NUM_JOINTS = 12
+# Leader servo index order per arm (interleaved L/R in the 12-vector).
+LEFT_LEADER_SERVO_INDICES = (0, 2, 4, 6, 8, 10)   # 5 arm + gripper
+RIGHT_LEADER_SERVO_INDICES = (1, 3, 5, 7, 9, 11)
 
 # ---------------------------------------------------------------------------
 # Re-export arm layout constants from move_actuators for callers that import
@@ -46,6 +63,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from move_actuators import (  # noqa: E402
+    ARM_DOF,
     ActuatorController,
     LEFT_CAN,
     LEFT_ROBSTRIDE_IDS,
@@ -63,15 +81,40 @@ from move_actuators import (  # noqa: E402
     _load_robstride,
 )
 
+# Follower gripper CAN IDs (last motor in each 7+1 chain).
+LEFT_GRIPPER_MOTOR_ID = 15
+RIGHT_GRIPPER_MOTOR_ID = 16
+GRIPPER_MOTOR_IDS = {LEFT_GRIPPER_MOTOR_ID, RIGHT_GRIPPER_MOTOR_ID}
+
+# Follower wrist_roll / wrist_yaw — no leader servos yet → always command 0.
+ZERO_FOLLOWER_MOTOR_IDS = {11, 12, 13, 14}
+# Indices inside the 16-vector: left wrist_roll/yaw = 5,6 ; right = 13,14
+ZERO_FOLLOWER_INDICES = (5, 6, 13, 14)
+
+# Leader 5+1 → which follower joint index (within one arm's 8 slots) each maps to.
+# Follower arm order: shoulder_pitch, shoulder_roll, shoulder_yaw, elbow_roll,
+#                     wrist_pitch, wrist_roll, wrist_yaw, gripper
+# Leader drives:      0,1,2,3,4, then skip 5,6, gripper→7
+LEADER_TO_FOLLOWER_ARM_INDEX = (0, 1, 2, 3, 4, 7)
+
+# Leader→follower sign flips (raw Dynamixel delta → follower joint delta).
+# Matches historical 12-DoF invert set; grippers moved from IDs 11/12 → 15/16.
+INVERT_DELTA_MOTOR_IDS = {1, 2, 5, 6, 7, 8, 9, 10, 15, 16}
+
 # ---------------------------------------------------------------------------
 # Helpers kept in this file (leader / teleop-specific logic)
 # ---------------------------------------------------------------------------
 
-def pad12(angles):
+def pad_leader12(angles):
+    """Pad/truncate Dynamixel readings to the 12-DoF leader vector."""
     a = [float(x) for x in angles]
-    while len(a) < 12:
+    while len(a) < LEADER_NUM_JOINTS:
         a.append(0.0)
-    return a[:12]
+    return a[:LEADER_NUM_JOINTS]
+
+
+# Back-compat alias used by record_episodes_3cam.py
+pad12 = pad_leader12
 
 
 def shortest_delta_units(prev_u: float, curr_u: float, period: float = SERVO_UNITS_PER_REV) -> float:
@@ -82,11 +125,63 @@ def shortest_delta_units(prev_u: float, curr_u: float, period: float = SERVO_UNI
 
 def accum_units_to_target_delta_rad(accum_units: float, motor_id: int, servo_idx: int | None = None) -> float:
     delta_rad = accum_units * RAD_PER_SERVO_UNIT
-    if motor_id in GRIPPER_MOTOR_IDS or servo_idx in GRIPPER_SERVO_INDICES:
-        delta_rad *= GRIPPER_MOTION_SCALE
-    if motor_id in {1, 2, 5, 6, 7, 8, 9, 10, 11, 12}:
+    if motor_id == LEFT_GRIPPER_MOTOR_ID or servo_idx == LEFT_GRIPPER_SERVO_INDEX:
+        delta_rad *= LEFT_GRIPPER_MOTION_SCALE
+    elif motor_id == RIGHT_GRIPPER_MOTOR_ID or servo_idx == RIGHT_GRIPPER_SERVO_INDEX:
+        delta_rad *= RIGHT_GRIPPER_MOTION_SCALE
+    if motor_id in INVERT_DELTA_MOTOR_IDS:
         return -delta_rad
     return delta_rad
+
+
+def leader12_to_follower16(
+    accum12: list[float] | np.ndarray,
+    robstride_ref16: dict[str, float] | np.ndarray,
+    left_motors: list[tuple[str, int]],
+    right_motors: list[tuple[str, int]],
+) -> np.ndarray:
+    """
+    Map leader 12-DoF accumulated deltas + follower refs → 16-DoF command vector.
+
+    Motors 11/12/13/14 (wrist_roll / wrist_yaw) are forced to absolute 0.0.
+    Grippers 15/16 are driven from leader servo indices 10/11.
+    """
+    accum = np.asarray(accum12, dtype=np.float64).reshape(-1)
+    if accum.size < LEADER_NUM_JOINTS:
+        accum = np.pad(accum, (0, LEADER_NUM_JOINTS - accum.size))
+
+    targets = np.zeros(NUM_JOINTS, dtype=np.float64)
+
+    def _ref(motor_name: str, fallback_idx: int) -> float:
+        if isinstance(robstride_ref16, dict):
+            return float(robstride_ref16.get(motor_name, 0.0))
+        ref = np.asarray(robstride_ref16, dtype=np.float64).reshape(-1)
+        return float(ref[fallback_idx]) if fallback_idx < len(ref) else 0.0
+
+    # Left arm: leader 5+1 → follower slots 0..4 and 7; slots 5,6 = 0
+    for leader_i, follower_i in enumerate(LEADER_TO_FOLLOWER_ARM_INDEX):
+        motor_name, motor_id = left_motors[follower_i]
+        servo_idx = LEFT_LEADER_SERVO_INDICES[leader_i]
+        base = _ref(motor_name, follower_i)
+        targets[follower_i] = base + accum_units_to_target_delta_rad(
+            float(accum[servo_idx]), motor_id, servo_idx
+        )
+
+    # Right arm: same pattern, offset by ARM_DOF
+    for leader_i, follower_i in enumerate(LEADER_TO_FOLLOWER_ARM_INDEX):
+        abs_i = ARM_DOF + follower_i
+        motor_name, motor_id = right_motors[follower_i]
+        servo_idx = RIGHT_LEADER_SERVO_INDICES[leader_i]
+        base = _ref(motor_name, abs_i)
+        targets[abs_i] = base + accum_units_to_target_delta_rad(
+            float(accum[servo_idx]), motor_id, servo_idx
+        )
+
+    # Explicitly park missing wrist DoFs (motors 11,12,13,14).
+    for idx in ZERO_FOLLOWER_INDICES:
+        targets[idx] = 0.0
+
+    return targets
 
 
 def ramp_toward(current: float, desired: float, max_step: float) -> float:
@@ -123,16 +218,37 @@ def get_joint_angles_from_motors(motors):
 # Logging helpers (--print-follower-qpos)
 # ---------------------------------------------------------------------------
 
-_FOLLOWER_JOINT_LABELS_12 = ("L0", "L1", "L2", "L3", "L4", "Lg", "R0", "R1", "R2", "R3", "R4", "Rg")
+_FOLLOWER_JOINT_LABELS_16 = (
+    "L0",
+    "L1",
+    "L2",
+    "L3",
+    "L4",
+    "L5",  # wrist_roll  (motor 11) — held at 0
+    "L6",  # wrist_yaw   (motor 13) — held at 0
+    "Lg",
+    "R0",
+    "R1",
+    "R2",
+    "R3",
+    "R4",
+    "R5",  # wrist_roll  (motor 12) — held at 0
+    "R6",  # wrist_yaw   (motor 14) — held at 0
+    "Rg",
+)
 
 
-def ramped_cmd_to_action12(left_motors, right_motors, ramped_cmd: dict) -> np.ndarray:
-    action = np.zeros(12, dtype=np.float64)
+def ramped_cmd_to_action16(left_motors, right_motors, ramped_cmd: dict) -> np.ndarray:
+    action = np.zeros(NUM_JOINTS, dtype=np.float64)
     for i, (name, _mid) in enumerate(left_motors):
         action[i] = float(ramped_cmd.get(name, 0.0))
     for i, (name, _mid) in enumerate(right_motors):
-        action[6 + i] = float(ramped_cmd.get(name, 0.0))
+        action[ARM_DOF + i] = float(ramped_cmd.get(name, 0.0))
     return action
+
+
+# Back-compat name
+ramped_cmd_to_action12 = ramped_cmd_to_action16
 
 
 def _format_joint_vector_line(name: str, row: np.ndarray, *, precision: int) -> str:
@@ -141,16 +257,21 @@ def _format_joint_vector_line(name: str, row: np.ndarray, *, precision: int) -> 
     return f"{name} = np.array([{inner}])  # len={len(r)}"
 
 
-def print_follower_qpos_action_block(*, loop_n: int, qpos12: np.ndarray, action12: np.ndarray, precision: int) -> None:
+def print_follower_qpos_action_block(*, loop_n: int, qpos16: np.ndarray, action16: np.ndarray, precision: int) -> None:
     print(f"\n--- [direct_teleop] loop={loop_n} ---")
-    print(_format_joint_vector_line("qpos", qpos12, precision=precision))
-    print(_format_joint_vector_line("action", action12, precision=precision))
+    print(_format_joint_vector_line("qpos", qpos16, precision=precision))
+    print(_format_joint_vector_line("action", action16, precision=precision))
     print("per_joint (index label qpos action):")
-    for j in range(min(12, len(qpos12), len(action12))):
-        lab = _FOLLOWER_JOINT_LABELS_12[j]
-        print(f"  [{j:2d}] {lab:4s}  qpos={float(qpos12[j]):.{precision}f}  action={float(action12[j]):.{precision}f}")
-    if float(np.max(np.abs(qpos12))) < 1e-6:
+    n = min(NUM_JOINTS, len(qpos16), len(action16), len(_FOLLOWER_JOINT_LABELS_16))
+    for j in range(n):
+        lab = _FOLLOWER_JOINT_LABELS_16[j]
+        print(f"  [{j:2d}] {lab:4s}  qpos={float(qpos16[j]):.{precision}f}  action={float(action16[j]):.{precision}f}")
+    if float(np.max(np.abs(qpos16))) < 1e-6:
         print("  WARN: |qpos| all near zero; reads likely failed (same as zeros in HDF5 when CAN drops).")
+
+
+# Back-compat name used by older call sites
+print_follower_qpos_action_block_12 = print_follower_qpos_action_block
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +290,7 @@ def main():
                         help="Read leader and compute targets but do not command follower motors")
     parser.add_argument("--no-print-follower", action="store_true",
                         help="Suppress the simple follower qpos line printed under each leader line "
-                             "(uses arm.read_joints12, same as scripts/read_follower_joints.py).")
+                             "(uses arm.read_joints, same as scripts/read_follower_joints.py).")
     parser.add_argument("--print-follower-precision", type=int, default=4,
                         help="Decimals for the simple follower line (default 4).")
     parser.add_argument("--print-follower-qpos", action="store_true",
@@ -200,6 +321,11 @@ def main():
     if not leader_motors:
         raise RuntimeError("No leader Dynamixel motors found")
     print(f"Found {len(leader_motors)} leader motors: {[m.id for m in leader_motors]}")
+    print(
+        f"Follower layout: {NUM_JOINTS} DoF (7+1 per arm). "
+        f"Zeroing wrist motors {sorted(ZERO_FOLLOWER_MOTOR_IDS)}; "
+        f"grippers = {sorted(GRIPPER_MOTOR_IDS)}."
+    )
 
     for m in leader_motors:
         try:
@@ -249,8 +375,8 @@ def main():
     print("Align leader and follower, then move leader. Ctrl+C to stop.")
 
     teleop_initialized = False
-    prev_servo = [0.0] * 12
-    accum = [0.0] * 12
+    prev_servo = [0.0] * LEADER_NUM_JOINTS
+    accum = [0.0] * LEADER_NUM_JOINTS
     robstride_ref: dict[str, float] = {}
     last_ramp_t: float | None = None
 
@@ -261,20 +387,20 @@ def main():
         while True:
             t0 = time.monotonic()
             angles = get_joint_angles_from_motors(leader_motors)
-            a12 = pad12(angles)
+            a12 = pad_leader12(angles)
 
-            if len(angles) < 12:
+            if len(angles) < LEADER_NUM_JOINTS:
                 time.sleep(loop_period)
                 continue
 
             # --- teleop zero: capture follower refs on first valid sample ---
             if not teleop_initialized:
                 if arm is not None and (left_bus or right_bus):
-                    refs = arm.read_joints12()
+                    refs = arm.read_joints()
                     for i, (motor_name, _) in enumerate(left_motors):
                         robstride_ref[motor_name] = float(refs[i])
                     for i, (motor_name, _) in enumerate(right_motors):
-                        robstride_ref[motor_name] = float(refs[6 + i])
+                        robstride_ref[motor_name] = float(refs[ARM_DOF + i])
                 else:
                     for motor_name, _ in left_motors + right_motors:
                         robstride_ref[motor_name] = 0.0
@@ -288,10 +414,13 @@ def main():
                 teleop_initialized = True
                 last_ramp_t = time.monotonic()
                 print("Teleop zero set: captured follower refs.")
+                print(
+                    "  Note: follower wrist_roll/yaw (motors 11,12,13,14) will be commanded to 0."
+                )
                 continue
 
             # --- accumulate leader deltas ---
-            for i in range(12):
+            for i in range(LEADER_NUM_JOINTS):
                 accum[i] += shortest_delta_units(prev_servo[i], a12[i])
                 prev_servo[i] = a12[i]
 
@@ -300,30 +429,23 @@ def main():
                 last_ramp_t = now
             dt = max(1e-4, min(now - last_ramp_t, ROBSTRIDE_RAMP_DT_MAX_S))
             last_ramp_t = now
-            max_step = ROBSTRIDE_RAMP_MAX_SPEED_RAD_S * dt
+            _ = ROBSTRIDE_RAMP_MAX_SPEED_RAD_S * dt  # ramp handled inside ActuatorController
 
-            # --- compute 12-vector desired targets ---
-            targets = np.zeros(12, dtype=np.float64)
-            for i, (motor_name, motor_id) in enumerate(left_motors):
-                servo_idx = [0, 2, 4, 6, 8, 10][i]
-                base = robstride_ref.get(motor_name, 0.0)
-                targets[i] = base + accum_units_to_target_delta_rad(accum[servo_idx], motor_id, servo_idx)
-            for i, (motor_name, motor_id) in enumerate(right_motors):
-                servo_idx = [1, 3, 5, 7, 9, 11][i]
-                base = robstride_ref.get(motor_name, 0.0)
-                targets[6 + i] = base + accum_units_to_target_delta_rad(accum[servo_idx], motor_id, servo_idx)
+            # --- compute 16-vector desired targets (zero wrist_roll/yaw) ---
+            targets = leader12_to_follower16(accum, robstride_ref, left_motors, right_motors)
 
             # --- optional pre-write qpos read ---
             will_print = args.print_every > 0 and (loops + 1) % args.print_every == 0
             qpos_log: np.ndarray | None = None
             if will_print and args.print_follower_qpos and qpos_reader is not None and follower_qpos_read_before_writes:
+                # Reader API still named read_qpos12; it walks left_motors/right_motors lists.
                 qpos_log = qpos_reader.read_qpos12(
                     left_bus, right_bus, left_motors, right_motors, _caller="direct_before_writes"
                 )
 
             # --- send to motors via ActuatorController ---
             if arm is not None:
-                arm.command_joints12(targets, ramp=True)
+                arm.command_joints(targets, ramp=True)
             ramped_cmd = arm._ramped if arm is not None else {}
 
             # --- optional post-write qpos read ---
@@ -343,21 +465,23 @@ def main():
                 # Simple follower line (matches scripts/read_follower_joints.py behavior).
                 if not args.no_print_follower and arm is not None:
                     try:
-                        fq = arm.read_joints12()
+                        fq = arm.read_joints()
                         prec = max(0, args.print_follower_precision)
                         follower_str = ", ".join(f"{float(v):.{prec}f}" for v in fq)
-                        print(f"             follower[:12]=[{follower_str}]")
+                        print(f"             follower[:{NUM_JOINTS}]=[{follower_str}]")
                     except Exception as e:
-                        print(f"             follower[:12] read failed: {e}")
+                        print(f"             follower[:{NUM_JOINTS}] read failed: {e}")
                 if args.print_follower_qpos:
-                    action12 = ramped_cmd_to_action12(left_motors, right_motors, ramped_cmd)
-                    qpos12 = (
+                    action16 = ramped_cmd_to_action16(left_motors, right_motors, ramped_cmd)
+                    qpos16 = (
                         np.asarray(qpos_log, dtype=np.float64).reshape(-1)
                         if qpos_log is not None
-                        else np.zeros(12, dtype=np.float64)
+                        else np.zeros(NUM_JOINTS, dtype=np.float64)
                     )
+                    if qpos16.size < NUM_JOINTS:
+                        qpos16 = np.pad(qpos16, (0, NUM_JOINTS - qpos16.size))
                     print_follower_qpos_action_block(
-                        loop_n=loops, qpos12=qpos12, action12=action12,
+                        loop_n=loops, qpos16=qpos16[:NUM_JOINTS], action16=action16,
                         precision=max(0, args.print_follower_qpos_precision),
                     )
 
