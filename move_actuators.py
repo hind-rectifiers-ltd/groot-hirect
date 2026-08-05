@@ -11,8 +11,11 @@ URDF.  Per-arm joint order:
     wrist_pitch, wrist_roll, wrist_yaw, gripper
 
 Joint vector order (radians):
-  [0..7]   left arm  — CAN ``can1``, motor IDs 1, 3, 5, 7, 9, 11, 13, 15
-  [8..15]  right arm — CAN ``can0``, motor IDs 2, 4, 6, 8, 10, 12, 14, 16
+  [0..7]   left arm  — Waveshare ``zcan1`` (hardware CAN2), motor IDs 1, 3, 5, 7, 9, 11, 13, 15
+  [8..15]  right arm — Waveshare ``zcan0`` (hardware CAN1), motor IDs 2, 4, 6, 8, 10, 12, 14, 16
+
+CAN channels: Waveshare USB-CAN-FD-B via ``zcan0`` / ``zcan1`` (no ``ip link``).
+Override with env ``ROBSTRIDE_LEFT_CAN`` / ``ROBSTRIDE_RIGHT_CAN`` (e.g. SocketCAN ``can1`` / ``can0``).
 
 The two wrist motors added per arm (wrist_roll / wrist_yaw) reuse the rs-02
 model and the same tuning (kp / kd / torque limit) as motors 9 and 10. The
@@ -45,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
 import threading
 import time
@@ -64,8 +68,10 @@ import numpy as np
 # If you flashed motors with different CAN IDs, edit the two lists below.
 LEFT_ROBSTRIDE_IDS: list[int] = [1, 3, 5, 7, 9, 11, 13, 15]
 RIGHT_ROBSTRIDE_IDS: list[int] = [2, 4, 6, 8, 10, 12, 14, 16]
-LEFT_CAN = "can1"
-RIGHT_CAN = "can0"
+# Waveshare USB-CAN-FD-B: hardware CAN2 -> zcan1 (left), CAN1 -> zcan0 (right).
+# Legacy gs_usb SocketCAN: can1 (left), can0 (right) — set via env vars below.
+LEFT_CAN = os.environ.get("ROBSTRIDE_LEFT_CAN", "zcan1")
+RIGHT_CAN = os.environ.get("ROBSTRIDE_RIGHT_CAN", "zcan0")
 
 MOTOR_MODEL_MAP: dict[int, str] = {
     1: "rs-03", 2: "rs-03", 3: "rs-03", 4: "rs-03",
@@ -275,7 +281,7 @@ class ActuatorController:
             safety_excluded_motor_ids: Motor IDs skipped by safety delta checks.
             safety_abort_on_breach: If True, disable torque and disconnect on breach.
             read_max_retries: Per-motor MECHANICAL_POSITION retries after stale RX frames.
-            parallel_bus_reads: Read ``can0`` and ``can1`` halves in parallel when both are live.
+            parallel_bus_reads: Read left and right CAN halves in parallel when both are live.
         """
         self._ramp = bool(ramp)
         self._ramp_max_speed = float(ramp_max_speed_rad_s)

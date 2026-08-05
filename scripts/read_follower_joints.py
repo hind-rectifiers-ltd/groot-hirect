@@ -6,8 +6,8 @@ No teleop, no MIT command stream, no ``follower_qpos_reader`` / MIT fallbacks �
 register reads so you can move the arm by hand and confirm encoders track.
 
 CAN layout matches ``move_actuators.py`` / ``direct_teleop.py`` (7+1 per arm):
-  left  ``can1`` ids 1,3,5,7,9,11,13,15 → indices 0..7
-  right ``can0`` ids 2,4,6,8,10,12,14,16 → indices 8..15
+  left  ``zcan1`` (Waveshare CAN2) ids 1,3,5,7,9,11,13,15 → indices 0..7
+  right ``zcan0`` (Waveshare CAN1) ids 2,4,6,8,10,12,14,16 → indices 8..15
 
 Default: connect, enable briefly, then **disable** all motors so you can backdrive by hand.
 If reads fail after disable, try ``--keep-torque-enabled`` (motors may hold position).

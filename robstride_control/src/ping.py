@@ -1,93 +1,99 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RobStride CAN 总线扫描工具 (Python 版)
+RobStride CAN bus scan / ping tool.
 
-用法: python3 scan_bus.py [channel]
-示例: 
-    sudo python3 scan_bus.py can0
-    sudo python3 scan_bus.py can1
+Usage:
+  # Old SocketCAN adapter:
+  sudo ip link set can0 up type can bitrate 1000000
+  python3 ping.py can0
 
-此脚本将 ping 1 到 254 范围内的所有 ID，并报告响应的电机。
-**注意：** 访问 CAN 硬件通常需要 'sudo' 权限。
+  # Waveshare USB-CAN-FD-B (no ip link — library opens the device):
+  #   Hardware label CAN1 -> waveshare0
+  #   Hardware label CAN2 -> waveshare1
+  python3 ping.py waveshare0
+
+This script pings IDs 1..254 and reports responding motors.
 """
 
 import sys
 import os
 import time
 
-# --- 导入 SDK ---
-# 假设此脚本与 position_control_mit.py 在同一目录
-# (即，上一级目录是 SDK 的根目录)
+# --- Import SDK ---
 try:
-    # 尝试将 SDK 根目录添加到路径
     sdk_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if sdk_path not in sys.path:
         sys.path.insert(0, sdk_path)
-    
-    # 1. 尝试从已安装的包导入
+
     from robstride_dynamics import RobstrideBus
 except ImportError:
-    # 2. 尝试从本地文件导入 (如果 SDK 未安装)
     try:
-        print("未找到 'robstride_dynamics' 包, 尝试从本地文件导入...")
+        print("Package 'robstride_dynamics' not found, trying local import...")
         from bus import RobstrideBus
     except ImportError as e:
-        print(f"❌ 无法导入 RobstrideBus SDK: {e}")
-        print("请确保此脚本的上一级目录是 SDK 的根目录,")
-        print("或者 SDK 已经通过 'pip install -e .' 安装。")
+        print(f"Cannot import RobstrideBus SDK: {e}")
+        print("Run from RobStride_Control/python, or: pip install -e .")
         sys.exit(1)
 
+
 def main():
-    # --- 1. 获取 CAN 通道 ---
     if len(sys.argv) > 1:
         channel = sys.argv[1]
     else:
-        channel = "can0"
+        channel = "waveshare0"
 
-    print(f"🚀 RobStride 总线扫描工具")
-    print(f"📡 正在扫描通道: {channel}")
-    print(f"🔍 搜索范围: ID 1 到 254")
+    print("RobStride bus scan")
+    print(f"Channel: {channel}")
+    if str(channel).lower().startswith(("waveshare", "zcan")):
+        hw = int("".join(c for c in channel if c.isdigit()) or "0") + 1
+        print(f"  -> Waveshare USB-CAN-FD-B hardware port CAN{hw}")
+        print("  -> Classic CAN @ 1 Mbps (not CAN FD)")
+        print("  -> No 'ip link' needed for this adapter")
+    else:
+        print("  -> SocketCAN interface (needs: sudo ip link set ... up)")
+    print("Scanning motor IDs 1 .. 254")
     print("...")
-    time.sleep(1) # 暂停一下让用户阅读
+    time.sleep(1)
 
-    # --- 2. 运行扫描 ---
     found_motors = None
     try:
-        # RobstrideBus.scan_channel 已经为我们实现了所有逻辑
-        # 它内部使用了 tqdm 来显示进度条
-        found_motors = RobstrideBus.scan_channel(channel, start_id=1, end_id=17) # end_id=255 会扫描到 254
-    
+        found_motors = RobstrideBus.scan_channel(channel, start_id=1, end_id=20)
     except Exception as e:
-        print(f"\n❌ 扫描出错: {e}")
+        print(f"\nScan error: {e}")
         if "Operation not permitted" in str(e) or "Permission denied" in str(e):
-            print("🔑 权限错误：请使用 'sudo' 运行此脚本来访问 CAN 硬件。")
-            print(f"   示例: sudo python3 {sys.argv[0]} {channel}")
+            print("Permission error: try sudo, or add udev rules for the USB device.")
+            print(f"  Example: sudo python3 {sys.argv[0]} {channel}")
         elif "No such device" in str(e):
-            print(f"🔌 设备错误：找不到 CAN 接口 '{channel}'。")
+            print(f"Device error: SocketCAN interface '{channel}' not found.")
+        elif "OpenDevice" in str(e) or "libcontrolcanfd" in str(e):
+            print("Waveshare adapter not opened. Check:")
+            print("  1) USB cable plugged in")
+            print("  2) lsusb shows 'Microchip' / CANFD device")
+            print("  3) lib path: USB-CAN-FD-B-Linux/VMware/x86-python3/libcontrolcanfd.so")
         sys.exit(1)
 
-    # --- 3. 打印结果 ---
     if not found_motors:
-        print("\n🚫 未在总线上找到任何响应的电机。")
+        print("\nNo motors responded.")
+        print("Checklist:")
+        print("  - Motor powered on")
+        print("  - H/L not swapped")
+        print("  - Termination ON (adapter switch + motor end if needed)")
+        print("  - Correct port: CAN1 -> waveshare0, CAN2 -> waveshare1")
+        print("  - Bitrate 1 Mbps (already set by this tool)")
     else:
-        print("\n✅ 扫描完成！发现以下电机：")
+        print("\nScan done. Motors found:")
         print("=" * 60)
-        print(f"{'电机 ID':<10} | {'MCU 唯一标识符 (UUID)':<45}")
+        print(f"{'Motor ID':<10} | {'MCU UUID':<45}")
         print("-" * 60)
-        
-        # found_motors 是一个字典: {id: (id, uuid_bytearray)}
-        # 我们按 ID 排序
+
         for motor_id in sorted(found_motors.keys()):
-            # value 是一个元组 (id, uuid)
             _id, uuid = found_motors[motor_id]
-            
-            # 将 bytearray 转换为更易读的十六进制字符串
-            uuid_hex = uuid.hex() # 'hex()' 是 bytearray 的一个方法
-            
+            uuid_hex = uuid.hex()
             print(f"{motor_id:<10} | {uuid_hex}")
-            
+
         print("=" * 60)
+
 
 if __name__ == "__main__":
     main()

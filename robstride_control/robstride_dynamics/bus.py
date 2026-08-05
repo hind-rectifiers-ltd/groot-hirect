@@ -101,11 +101,22 @@ class RobstrideBus:
                 f"Do not call `{self.__class__.__name__}.connect()` twice."
             )
 
-        self.channel_handler = can.interface.Bus(
-            interface="socketcan",
-            channel=self.channel,
-            bitrate=self.bitrate,
-        )
+        # SocketCAN: "can0" / "can1"
+        # Waveshare USB-CAN-FD-B: "waveshare0" (hw CAN1) / "waveshare1" (hw CAN2)
+        channel_l = str(self.channel).lower()
+        if channel_l.startswith("waveshare") or channel_l.startswith("zcan"):
+            from .waveshare_zcanfd import WaveshareZCanFdBus
+
+            self.channel_handler = WaveshareZCanFdBus(
+                channel=self.channel,
+                bitrate=self.bitrate,
+            )
+        else:
+            self.channel_handler = can.interface.Bus(
+                interface="socketcan",
+                channel=self.channel,
+                bitrate=self.bitrate,
+            )
         print(f"{self.__class__.__name__} connected.")
 
     def disconnect(self, disable_torque: bool = True) -> None:
