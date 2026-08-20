@@ -17,12 +17,24 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import sys
 from pathlib import Path
 
 import h5py
 import numpy as np
 import torch
 from tqdm import tqdm
+
+_RECORD_DIR = Path(__file__).resolve().parent
+if str(_RECORD_DIR) not in sys.path:
+    sys.path.insert(0, str(_RECORD_DIR))
+
+from joint_layout import (  # noqa: E402
+    ACTION_KEYS,
+    EXPECTED_GROUP_DIMS,
+    NUM_JOINTS,
+    pad_vector,
+)
 
 try:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -70,11 +82,21 @@ def _load_episode(path: Path):
     if ts is not None:
         n = min(n, len(ts))
 
+    # Pad short joint vectors (e.g. legacy 12D) to NUM_JOINTS with zeros.
+    def _pad_T(x: np.ndarray) -> np.ndarray:
+        rows = [pad_vector(row, NUM_JOINTS).astype(np.float32) for row in x[:n]]
+        return np.stack(rows, axis=0) if rows else np.zeros((0, NUM_JOINTS), dtype=np.float32)
+
+    qpos_out = _pad_T(qpos)
+    action_out = _pad_T(action)
+    qvel_out = _pad_T(qvel) if qvel is not None else None
+    effort_out = _pad_T(effort) if effort is not None else None
+
     return {
-        "qpos": qpos[:n],
-        "action": action[:n],
-        "qvel": qvel[:n] if qvel is not None else None,
-        "effort": effort[:n] if effort is not None else None,
+        "qpos": qpos_out,
+        "action": action_out,
+        "qvel": qvel_out,
+        "effort": effort_out,
         "timestamp": ts[:n] if ts is not None else None,
         "task": str(task),
         "images": {cam: imgs[cam][:n] for cam in CAMERA_NAMES},
@@ -83,19 +105,19 @@ def _load_episode(path: Path):
 
 
 def _write_modality_json(dataset_path: Path) -> None:
+    # Follower layout (7 arm + gripper per side). Short groups are zero-padded at record/infer time.
+    start = 0
+    state: dict[str, dict[str, int]] = {}
+    action: dict[str, dict[str, int]] = {}
+    for key in ACTION_KEYS:
+        dim = EXPECTED_GROUP_DIMS[key]
+        state[key] = {"start": start, "end": start + dim}
+        action[key] = {"start": start, "end": start + dim}
+        start += dim
+    assert start == NUM_JOINTS, f"modality dims sum to {start}, expected {NUM_JOINTS}"
     modality = {
-        "state": {
-            "left_arm": {"start": 0, "end": 5},
-            "left_gripper": {"start": 5, "end": 6},
-            "right_arm": {"start": 6, "end": 11},
-            "right_gripper": {"start": 11, "end": 12},
-        },
-        "action": {
-            "left_arm": {"start": 0, "end": 5},
-            "left_gripper": {"start": 5, "end": 6},
-            "right_arm": {"start": 6, "end": 11},
-            "right_gripper": {"start": 11, "end": 12},
-        },
+        "state": state,
+        "action": action,
         "video": {
             "head": {"original_key": "observation.images.cam_head"},
             "left_wrist": {"original_key": "observation.images.cam_left_wrist"},
@@ -119,8 +141,8 @@ def main() -> None:
     parser.add_argument("--default-task", type=str, default="demo task")
     parser.add_argument("--robot-type", type=str, default="custom_humanoid")
     parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--state-dim", type=int, default=12)
-    parser.add_argument("--action-dim", type=int, default=12)
+    parser.add_argument("--state-dim", type=int, default=NUM_JOINTS)
+    parser.add_argument("--action-dim", type=int, default=NUM_JOINTS)
     parser.add_argument("--use-videos", action="store_true", help="Store camera streams as mp4s instead of images")
     parser.add_argument("--overwrite", action="store_true", help="Delete existing destination dataset first")
     args = parser.parse_args()

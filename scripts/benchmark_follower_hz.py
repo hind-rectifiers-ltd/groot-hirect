@@ -7,11 +7,11 @@ current synchronous ``ActuatorController`` path can sustain read/write loops
 without missed deadlines, read failures, or zero dropouts.
 
 Modes (in increasing cost):
-  read         — ``read_joints12()`` only
-  write        — hold position via ``command_joints12()`` (includes safety encoder read)
+  read         — ``read_joints()`` only
+  write        — hold position via ``command_joints()`` (includes safety encoder read)
   teleop       — one read + command hold (matches direct teleop / policy tick shape)
-  record       — N-sample median read + command with ``feedback12`` (matches ``record_episodes_3cam``)
-  record_legacy — old path: median read + command without ``feedback12`` (4 reads/tick at N=3)
+  record       — N-sample median read + command with ``feedback`` (matches ``record_episodes_3cam``)
+  record_legacy — old path: median read + command without ``feedback`` (extra safety read)
 
 Examples:
   uv run python scripts/benchmark_follower_hz.py --rate-hz 30 --mode read --duration-s 20
@@ -34,9 +34,26 @@ _REPO = Path(__file__).resolve().parent.parent
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from move_actuators import ActuatorController, JOINT_MOTOR_IDS  # noqa: E402
+from move_actuators import ActuatorController, JOINT_MOTOR_IDS, NUM_JOINTS  # noqa: E402
 
-_LABELS = ("L0", "L1", "L2", "L3", "L4", "Lg", "R0", "R1", "R2", "R3", "R4", "Rg")
+_LABELS = (
+    "L0",
+    "L1",
+    "L2",
+    "L3",
+    "L4",
+    "L5",
+    "L6",
+    "Lg",
+    "R0",
+    "R1",
+    "R2",
+    "R3",
+    "R4",
+    "R5",
+    "R6",
+    "Rg",
+)
 
 
 @dataclass
@@ -84,7 +101,7 @@ def _snapshot_arm_stats(arm: ActuatorController) -> tuple[int, int, int]:
 def _count_zero_joints(q: np.ndarray, live_mask: np.ndarray, baseline: np.ndarray) -> int:
     """Count joints that read 0.0 while bus is live and baseline was non-zero."""
     n = 0
-    for i in range(12):
+    for i in range(NUM_JOINTS):
         if not live_mask[i]:
             continue
         if abs(float(baseline[i])) < 1e-4:
@@ -95,16 +112,17 @@ def _count_zero_joints(q: np.ndarray, live_mask: np.ndarray, baseline: np.ndarra
 
 
 def _live_mask(arm: ActuatorController) -> np.ndarray:
-    mask = np.zeros(12, dtype=bool)
-    for i in range(6):
+    mask = np.zeros(NUM_JOINTS, dtype=bool)
+    half = NUM_JOINTS // 2
+    for i in range(half):
         if arm._left_bus is not None:
             mask[i] = True
         if arm._right_bus is not None:
-            mask[6 + i] = True
+            mask[half + i] = True
     return mask
 
 
-def _read_median12(
+def _read_median(
     arm: ActuatorController,
     *,
     samples: int,
@@ -113,10 +131,13 @@ def _read_median12(
     n = max(1, samples)
     stack = []
     for s in range(n):
-        stack.append(arm.read_joints12())
+        stack.append(arm.read_joints())
         if s + 1 < n and sample_gap_s > 0.0:
             time.sleep(sample_gap_s)
     return np.median(np.stack(stack, axis=0), axis=0)
+
+
+_read_median12 = _read_median
 
 
 def _run_loop(
@@ -131,7 +152,7 @@ def _run_loop(
     period = 1.0 / max(target_hz, 0.25)
     stats = LoopStats(target_hz=target_hz, mode=mode, duration_s=duration_s)
 
-    baseline = arm.read_joints12()
+    baseline = arm.read_joints()
     arm.seed_ramp_from_angles(baseline)
     live = _live_mask(arm)
     hold_target = baseline.copy()
@@ -143,32 +164,32 @@ def _run_loop(
         t0 = time.monotonic()
 
         if mode == "read":
-            q = arm.read_joints12()
+            q = arm.read_joints()
             stats.zero_joint_events += _count_zero_joints(q, live, baseline)
         elif mode == "write":
-            sent = arm.command_joints12(hold_target, ramp=True)
+            sent = arm.command_joints(hold_target, ramp=True)
             hold_target = sent.copy()
         elif mode == "teleop":
-            q = arm.read_joints12()
+            q = arm.read_joints()
             stats.zero_joint_events += _count_zero_joints(q, live, baseline)
-            arm.command_joints12(q, ramp=True, feedback12=q)
+            arm.command_joints(q, ramp=True, feedback12=q)
         elif mode == "record":
             raw_last: np.ndarray | None = None
             stack: list[np.ndarray] = []
             n = max(1, median_samples)
             for s in range(n):
-                raw_last = arm.read_joints12()
+                raw_last = arm.read_joints()
                 stack.append(raw_last)
                 stats.zero_joint_events += _count_zero_joints(raw_last, live, baseline)
                 if s + 1 < n and median_gap_s > 0.0:
                     time.sleep(median_gap_s)
             assert raw_last is not None
             hold = stack[0] if n == 1 else np.median(np.stack(stack, axis=0), axis=0)
-            arm.command_joints12(hold, ramp=True, feedback12=raw_last)
+            arm.command_joints(hold, ramp=True, feedback12=raw_last)
         elif mode == "record_legacy":
-            q = _read_median12(arm, samples=median_samples, sample_gap_s=median_gap_s)
+            q = _read_median(arm, samples=median_samples, sample_gap_s=median_gap_s)
             stats.zero_joint_events += _count_zero_joints(q, live, baseline)
-            arm.command_joints12(q, ramp=True)
+            arm.command_joints(q, ramp=True)
         else:
             raise ValueError(f"unknown mode: {mode}")
 
@@ -281,9 +302,9 @@ def main() -> None:
     try:
         arm.connect()
         print(arm.read_stats_line(), flush=True)
-        init_q = arm.read_joints12()
+        init_q = arm.read_joints()
         prec = 4
-        inner = ", ".join(f"{float(init_q[j]):.{prec}f}" for j in range(12))
+        inner = ", ".join(f"{float(init_q[j]):.{prec}f}" for j in range(NUM_JOINTS))
         print(f"  initial qpos = [{inner}]", flush=True)
 
         all_ok = True

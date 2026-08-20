@@ -205,7 +205,7 @@ If plots look wrong, ignore a “lucky” low average.
 
 #### 2. Use MAE as a rough numeric gate (joint-space radians)
 
-These are **rules of thumb** for a 12-DoF-style arm in radians, comparing checkpoints on the **same** dataset and settings. Retune after you see what a known-good / known-bad run produces on your setup.
+These are **rules of thumb** for a 16-DoF-style dual-arm (7+1 per side) in radians, comparing checkpoints on the **same** dataset and settings. Retune after you see what a known-good / known-bad run produces on your setup.
 
 | Average MAE (approx.) | How to read it |
 |---|---|

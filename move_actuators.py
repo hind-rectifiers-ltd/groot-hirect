@@ -267,6 +267,7 @@ class ActuatorController:
         safety_max_initial_delta_rad: float = SAFETY_MAX_INITIAL_DELTA_RAD,
         safety_excluded_motor_ids: tuple[int, ...] = SAFETY_EXCLUDED_MOTOR_IDS,
         safety_abort_on_breach: bool = True,
+        safety_clamp: bool = False,
         read_max_retries: int = 4,
         parallel_bus_reads: bool = True,
     ):
@@ -280,6 +281,9 @@ class ActuatorController:
             safety_max_initial_delta_rad: Limit for the first command after :meth:`connect`.
             safety_excluded_motor_ids: Motor IDs skipped by safety delta checks.
             safety_abort_on_breach: If True, disable torque and disconnect on breach.
+                Ignored when ``safety_clamp`` is True.
+            safety_clamp: If True, clamp offending targets to ``encoder ± limit`` (shortest
+                path) and keep running instead of aborting. Takes precedence over abort.
             read_max_retries: Per-motor MECHANICAL_POSITION retries after stale RX frames.
             parallel_bus_reads: Read left and right CAN halves in parallel when both are live.
         """
@@ -291,7 +295,9 @@ class ActuatorController:
         self._safety_max_initial_delta_rad = float(max(0.0, safety_max_initial_delta_rad))
         self._safety_excluded_motor_ids = {int(mid) for mid in safety_excluded_motor_ids}
         self._safety_abort_on_breach = bool(safety_abort_on_breach)
+        self._safety_clamp = bool(safety_clamp)
         self._safety_command_count = 0
+        self._last_safety_warn_t = 0.0
         self._read_max_retries = max(0, int(read_max_retries))
         self._parallel_bus_reads = bool(parallel_bus_reads)
         self._read_stats_lock = threading.Lock()
@@ -335,6 +341,14 @@ class ActuatorController:
         self._last_cmd_t = time.monotonic()
         self._safety_command_count = 0
         self._connected = True
+        print(
+            f"[move_actuators] connected "
+            f"(left={LEFT_CAN}:{len(self._left_motors)} motors, "
+            f"right={RIGHT_CAN}:{len(self._right_motors)} motors, "
+            f"safety_clamp={self._safety_clamp}, "
+            f"safety_max_delta={self._safety_max_delta_rad:.3f} rad)",
+            flush=True,
+        )
 
     def disconnect(self, *, send_zero: bool = True) -> None:
         """
@@ -375,21 +389,32 @@ class ActuatorController:
         desired12: np.ndarray,
         *,
         feedback12: np.ndarray | list | tuple | None = None,
-    ) -> None:
+    ) -> np.ndarray:
         """
-        Abort if any ramp-limited target is too far from the live encoder.
+        Check each ramp-limited target against the live encoder and either abort
+        or clamp when it jumps too far.
 
         Uses shortest angular distance so joints near ±2π (e.g. encoder 6.25 rad vs
         0.02 rad) are treated as ~0.05 rad apart, not ~6.2 rad.
 
+        Behaviour on breach:
+          * ``safety_clamp=True``  → clamp target to ``encoder ± limit`` and continue
+          * ``safety_clamp=False`` → raise :class:`SafetyLimitBreachError` (and
+            disconnect if ``safety_abort_on_breach``)
+
         Args:
             feedback12: Optional encoder-frame joint vector from a read in the same
-                        control tick. When provided, skips a second ``read_joints12``
+                        control tick. When provided, skips a second ``read_joints``
                         call (saves ~10 ms per command at 30 Hz).
+
+        Returns:
+            Target vector to command — unchanged when within limits, or clamped
+            per joint when ``safety_clamp`` is enabled.
         """
+        desired = _pad12(desired12)
         if not self._safety_enabled:
             self._safety_command_count += 1
-            return
+            return desired
 
         limit = (
             self._safety_max_initial_delta_rad
@@ -399,7 +424,7 @@ class ActuatorController:
         self._safety_command_count += 1
 
         if limit <= 0.0:
-            return
+            return desired
 
         if feedback12 is not None:
             current = _pad12(feedback12)
@@ -413,13 +438,15 @@ class ActuatorController:
             if mid in self._safety_excluded_motor_ids:
                 continue
             enc = float(current[i])
-            tgt = float(desired12[i])
-            delta = abs(_shortest_delta_rad(tgt, enc))
-            if delta > limit:
-                breaches.append((mid, enc, tgt, delta))
+            tgt = float(desired[i])
+            signed = _shortest_delta_rad(tgt, enc)
+            if abs(signed) > limit:
+                breaches.append((mid, enc, tgt, abs(signed)))
+                if self._safety_clamp:
+                    desired[i] = enc + math.copysign(limit, signed)
 
         if not breaches:
-            return
+            return desired
 
         which = "first command after connect" if self._safety_command_count == 1 else "command tick"
         details = "\n".join(
@@ -427,6 +454,18 @@ class ActuatorController:
             f"|delta|={delta:+.4f} rad  (limit {limit:.4f})"
             for mid, enc, tgt, delta in breaches
         )
+
+        if self._safety_clamp:
+            now = time.monotonic()
+            if now - self._last_safety_warn_t > 1.0:
+                self._last_safety_warn_t = now
+                print(
+                    "[move_actuators] safety clamp active — capping "
+                    f"{len(breaches)} joint(s) to ±{limit:.3f} rad ({which}):\n" + details,
+                    flush=True,
+                )
+            return desired
+
         msg = (
             "Safety limits breached: joint target jump too large in encoder frame "
             f"({which}).\n"
@@ -512,7 +551,12 @@ class ActuatorController:
             sent[ARM_DOF + i] = target
 
         # Safety applies to ramp-limited targets actually sent, not the full policy horizon.
-        self._enforce_command_safety(sent, feedback12=feedback12)
+        # In clamp mode this returns per-joint capped targets instead of raising.
+        sent = self._enforce_command_safety(sent, feedback12=feedback12)
+        for i, (name, _mid) in enumerate(self._left_motors):
+            self._ramped[name] = float(sent[i])
+        for i, (name, _mid) in enumerate(self._right_motors):
+            self._ramped[name] = float(sent[ARM_DOF + i])
 
         for i, (name, mid) in enumerate(self._left_motors):
             if self._left_bus:

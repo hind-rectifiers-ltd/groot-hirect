@@ -46,7 +46,25 @@ CAMERA_BANNER_RGB: dict[str, tuple[int, int, int]] = {
     "cam_right_wrist": (200, 90, 30),
 }
 
-# Default humanoid 12-DoF naming (5+1 per arm); falls back to j0.. for other dims
+# Default humanoid 16-DoF naming (7+1 per arm); also recognize legacy 12-DoF labels
+_DEFAULT_JOINT_LABELS_16 = (
+    "L0",
+    "L1",
+    "L2",
+    "L3",
+    "L4",
+    "L5",
+    "L6",
+    "Lg",
+    "R0",
+    "R1",
+    "R2",
+    "R3",
+    "R4",
+    "R5",
+    "R6",
+    "Rg",
+)
 _DEFAULT_JOINT_LABELS_12 = (
     "L0",
     "L1",
@@ -64,6 +82,8 @@ _DEFAULT_JOINT_LABELS_12 = (
 
 
 def _joint_labels(dim: int) -> list[str]:
+    if dim == len(_DEFAULT_JOINT_LABELS_16):
+        return list(_DEFAULT_JOINT_LABELS_16)
     if dim == len(_DEFAULT_JOINT_LABELS_12):
         return list(_DEFAULT_JOINT_LABELS_12)
     return [f"j{i}" for i in range(dim)]
@@ -106,7 +126,7 @@ def plot_qpos_action_on_axes(
     ax_a.clear()
     for i in range(D):
         color = palette[i % len(palette)]
-        lbl = labels[i] if D <= 12 else None
+        lbl = labels[i] if D <= 16 else None
         ax_q.plot(x, qpos[:, i], color=color, lw=1.0, label=lbl)
         ax_a.plot(x, action[:, i], color=color, lw=1.0, label=lbl)
 
@@ -130,13 +150,13 @@ def plot_qpos_action_on_axes(
     ax_q.set_ylabel("qpos")
     ax_q.set_title("Joint positions (observation.state)")
     ax_q.grid(True, alpha=0.3)
-    if D <= 12:
+    if D <= 16:
         ax_q.legend(loc="upper right", fontsize=6, ncol=4, framealpha=0.7)
     ax_a.set_ylabel("action")
     ax_a.set_xlabel("frame index")
     ax_a.set_title("Actions (commands)")
     ax_a.grid(True, alpha=0.3)
-    if D <= 12:
+    if D <= 16:
         ax_a.legend(loc="upper right", fontsize=6, ncol=4, framealpha=0.7)
 
 
@@ -312,7 +332,7 @@ def _format_qpos_lines(qpos_row: np.ndarray, precision: int = 4) -> list[str]:
     """
     Format a qpos vector as one-or-more compact lines for on-image overlay.
 
-    - 12-D vectors are split into left arm and right arm rows using the standard labels.
+    - 16-D vectors are split into left arm and right arm rows using the standard labels.
     - Other dimensions are split into chunks of up to 6 joints per line.
     - Decimal output (no scientific notation), with a leading sign so columns line up.
     """

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
 Live client for the GR00T PolicyServer (run_gr00t_server.py) with the same 3-camera /
-12-DoF layout as record_episodes_3cam.py.
+16-DoF follower layout as record_episodes_3cam.py / direct_teleop.py.
 
 Observation layout matches NEW_EMBODIMENT + record/custom_3cam_config.py:
   video: head, left_wrist, right_wrist  — uint8 (B,T,H,W,C)
-  state: left_arm(5), left_gripper(1), right_arm(5), right_gripper(1)
+  state: left_arm(7), left_gripper(1), right_arm(7), right_gripper(1)
   language: annotation.human.task_description
+
+Missing / short group dims are zero-padded (e.g. old 5-DoF arm policies).
 
 Example:
   uv run python record/policy_client_3cam.py \\
@@ -52,8 +54,19 @@ import numpy as np
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+if str(_REPO_ROOT / "record") not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT / "record"))
 
 from gr00t.policy.server_client import PolicyClient
+from joint_layout import (  # noqa: E402
+    GRIPPER_JOINT_INDICES,
+    JOINT_LABELS_16,
+    NUM_JOINTS,
+    actions_to_chunk,
+    format_joint_vector,
+    pad_vector,
+    qpos_to_state_dict,
+)
 
 # Same camera IDs as record_episodes_3cam.py
 CAMERA_NAMES = ("cam_head", "cam_left_wrist", "cam_right_wrist")
@@ -61,21 +74,13 @@ VIDEO_KEYS = ("head", "left_wrist", "right_wrist")
 CAM_TO_VIDEO = dict(zip(CAMERA_NAMES, VIDEO_KEYS, strict=True))
 
 LANGUAGE_KEY = "annotation.human.task_description"
-
-# Joint layout: L arm 0-4, L gripper 5, R arm 6-10, R gripper 11 (motor ids 11/12).
-GRIPPER_JOINT_INDICES = (5, 11)
-ACTION_KEYS = ("left_arm", "left_gripper", "right_arm", "right_gripper")
 DEFAULT_ACTION_HORIZON = 16
-JOINT_LABELS_12 = ("L0", "L1", "L2", "L3", "L4", "Lg", "R0", "R1", "R2", "R3", "R4", "Rg")
 
-
-def format_joint_vector12(vec: np.ndarray, *, precision: int = 4) -> str:
-    """Compact labeled 12-DoF line for logging."""
-    v = np.asarray(vec, dtype=np.float64).reshape(-1)
-    if v.size < 12:
-        v = np.pad(v, (0, 12 - v.size))
-    parts = [f"{JOINT_LABELS_12[i]}={float(v[i]):+.{precision}f}" for i in range(12)]
-    return "  ".join(parts)
+# Back-compat aliases
+JOINT_LABELS_12 = JOINT_LABELS_16
+format_joint_vector12 = format_joint_vector
+qpos12_to_state_dict = qpos_to_state_dict
+actions_to_chunk12 = actions_to_chunk
 
 
 def log_step_state(
@@ -86,28 +91,11 @@ def log_step_state(
     precision: int = 4,
     extra: str = "",
 ) -> None:
-    """Print full qpos and cmd for all 12 joints."""
+    """Print full qpos and cmd for all joints."""
     suffix = f"  {extra}" if extra else ""
     print(f"step {step}{suffix}", flush=True)
-    print(f"  qpos  {format_joint_vector12(qpos, precision=precision)}", flush=True)
-    print(f"  cmd   {format_joint_vector12(cmd, precision=precision)}", flush=True)
-
-
-def qpos12_to_state_dict(qpos12: np.ndarray) -> dict[str, np.ndarray]:
-    """12D vector -> GR00T state dict with per-group shapes (1, 1, D)."""
-    q = np.asarray(qpos12, dtype=np.float32).reshape(-1)
-    if q.size < 12:
-        q = np.pad(q, (0, 12 - q.size))
-    left_arm = q[0:5].reshape(1, 1, 5).astype(np.float32)
-    left_gripper = q[5:6].reshape(1, 1, 1).astype(np.float32)
-    right_arm = q[6:11].reshape(1, 1, 5).astype(np.float32)
-    right_gripper = q[11:12].reshape(1, 1, 1).astype(np.float32)
-    return {
-        "left_arm": left_arm,
-        "left_gripper": left_gripper,
-        "right_arm": right_arm,
-        "right_gripper": right_gripper,
-    }
+    print(f"  qpos  {format_joint_vector(qpos, precision=precision)}", flush=True)
+    print(f"  cmd   {format_joint_vector(cmd, precision=precision)}", flush=True)
 
 
 def images_dict_to_video(images: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
@@ -123,49 +111,29 @@ def images_dict_to_video(images: dict[str, np.ndarray]) -> dict[str, np.ndarray]
 
 def build_gr00t_observation(
     images: dict[str, np.ndarray],
-    qpos12: np.ndarray,
+    qpos: np.ndarray,
     task: str,
 ) -> dict[str, Any]:
     return {
         "video": images_dict_to_video(images),
-        "state": qpos12_to_state_dict(qpos12),
+        "state": qpos_to_state_dict(qpos),
         "language": {LANGUAGE_KEY: [[task]]},
     }
 
 
 def actions_to_vector12(action: dict[str, np.ndarray], time_index: int = 0) -> np.ndarray:
-    """
-    Decode policy output dict (unnormalized joint targets) to a single 12D step.
-
-    Each value is (B, T, D); we take batch 0, timestep ``time_index``.
-    """
-    chunk = actions_to_chunk12(action)
+    """Decode policy output to a single 16D step (name kept for back-compat)."""
+    chunk = actions_to_chunk(action)
     if time_index < 0 or time_index >= chunk.shape[0]:
         raise IndexError(f"action time_index {time_index} out of range for horizon {chunk.shape[0]}")
     return chunk[time_index].astype(np.float32)
 
 
-def actions_to_chunk12(action: dict[str, np.ndarray]) -> np.ndarray:
-    """Decode policy output to (T, 12) absolute joint targets."""
-    parts = []
-    horizon: int | None = None
-    for key in ACTION_KEYS:
-        if key not in action:
-            raise KeyError(f"Missing action key {key!r}; got {list(action.keys())}")
-        arr = np.asarray(action[key], dtype=np.float32)
-        if arr.ndim != 3:
-            raise ValueError(f"action[{key!r}] expected (B,T,D), got {arr.shape}")
-        slab = arr[0]
-        if horizon is None:
-            horizon = int(slab.shape[0])
-        elif int(slab.shape[0]) != horizon:
-            raise ValueError(f"action horizon mismatch for {key!r}: {slab.shape[0]} vs {horizon}")
-        parts.append(slab.reshape(horizon, -1))
-    return np.concatenate(parts, axis=-1).astype(np.float32)
+actions_to_vector16 = actions_to_vector12
 
 
 def upsample_chunk_linear(chunk: np.ndarray, factor: int) -> np.ndarray:
-    """Linearly upsample (T, 12) chunk to (T*factor, 12) for finer control ticks."""
+    """Linearly upsample (T, D) chunk to finer control ticks."""
     if factor <= 1:
         return np.asarray(chunk, dtype=np.float32)
     c = np.asarray(chunk, dtype=np.float64)
@@ -189,11 +157,13 @@ class ActionTargetSmoother:
         gripper_alpha: float = 0.65,
         max_arm_step: float = 0.0,
         max_gripper_step: float = 0.025,
+        state_dim: int = NUM_JOINTS,
     ):
         self._arm_alpha = float(np.clip(arm_alpha, 0.0, 1.0))
         self._gripper_alpha = float(np.clip(gripper_alpha, 0.0, 1.0))
         self._max_arm_step = float(max(0.0, max_arm_step))
         self._max_gripper_step = float(max(0.0, max_gripper_step))
+        self._state_dim = int(state_dim)
         self._state: np.ndarray | None = None
 
     @property
@@ -202,24 +172,20 @@ class ActionTargetSmoother:
             return None
         return self._state.astype(np.float32)
 
-    def reset(self, qpos12: np.ndarray) -> None:
-        self._state = np.asarray(qpos12, dtype=np.float64).reshape(-1).copy()
-        if self._state.size < 12:
-            self._state = np.pad(self._state, (0, 12 - self._state.size))
+    def reset(self, qpos: np.ndarray) -> None:
+        self._state = pad_vector(qpos, self._state_dim)
 
     @property
     def enabled(self) -> bool:
         return self._arm_alpha > 0.0 or self._gripper_alpha > 0.0
 
-    def apply(self, target12: np.ndarray) -> np.ndarray:
-        t = np.asarray(target12, dtype=np.float64).reshape(-1)
-        if t.size < 12:
-            t = np.pad(t, (0, 12 - t.size))
+    def apply(self, target: np.ndarray) -> np.ndarray:
+        t = pad_vector(target, self._state_dim)
         if self._state is None:
             self.reset(t)
             return t.astype(np.float32)
         out = self._state.copy()
-        for i in range(12):
+        for i in range(self._state_dim):
             alpha = self._gripper_alpha if i in GRIPPER_JOINT_INDICES else self._arm_alpha
             if alpha <= 0.0:
                 out[i] = float(t[i])
@@ -238,9 +204,9 @@ def blend_chunk_start(chunk: np.ndarray, from_pose: np.ndarray, blend_steps: int
     if blend_steps <= 0:
         return chunk
     c = np.asarray(chunk, dtype=np.float64).copy()
-    start = np.asarray(from_pose, dtype=np.float64).reshape(-1)
-    if start.size < 12:
-        start = np.pad(start, (0, 12 - start.size))
+    start = pad_vector(from_pose, c.shape[1] if c.ndim == 2 else NUM_JOINTS)
+    if start.size != c.shape[1]:
+        start = pad_vector(start, c.shape[1])
     n = min(blend_steps, c.shape[0])
     for i in range(n):
         w = (i + 1) / float(n)
@@ -298,6 +264,7 @@ class PolicyRobstrideDriver:
         auto_zero: bool = True,
         safety_max_delta_rad: float = 1.5,
         safety_max_initial_delta_rad: float = 1.0,
+        safety_clamp: bool = True,
     ):
         if str(_REPO_ROOT) not in sys.path:
             sys.path.insert(0, str(_REPO_ROOT))
@@ -308,16 +275,22 @@ class PolicyRobstrideDriver:
             LEFT_ROBSTRIDE_IDS,
             RIGHT_ROBSTRIDE_IDS,
             ActuatorController,
+            NUM_JOINTS as ACTUATOR_NUM_JOINTS,
         )
+
+        if int(ACTUATOR_NUM_JOINTS) != NUM_JOINTS:
+            raise RuntimeError(
+                f"move_actuators NUM_JOINTS={ACTUATOR_NUM_JOINTS} != layout {NUM_JOINTS}"
+            )
 
         self._dt = dt
         self._dry_run = dry_run
         self._ramp_from_feedback = ramp_from_feedback
         self._ramp_max_speed_rad_s = ramp_max_speed_rad_s
         self._motor_ids: list[int] = list(LEFT_ROBSTRIDE_IDS) + list(RIGHT_ROBSTRIDE_IDS)
-        # One-turn-unwrap offsets in the motor's encoder frame: read_qpos12 returns
-        # (raw - boot_offsets); command_a12 sends (target + boot_offsets).
-        self._boot_offsets: np.ndarray = np.zeros(12, dtype=np.float64)
+        # One-turn-unwrap offsets in the motor's encoder frame: read_qpos returns
+        # (raw - boot_offsets); command_a sends (target + boot_offsets).
+        self._boot_offsets: np.ndarray = np.zeros(NUM_JOINTS, dtype=np.float64)
         self._last_raw_encoder: np.ndarray | None = None
         self._arm: ActuatorController | None = None
 
@@ -333,6 +306,8 @@ class PolicyRobstrideDriver:
                 ramp_dt_max_s=float(dt.ROBSTRIDE_RAMP_DT_MAX_S),
                 safety_max_delta_rad=float(safety_max_delta_rad),
                 safety_max_initial_delta_rad=float(safety_max_initial_delta_rad),
+                safety_clamp=bool(safety_clamp),
+                safety_abort_on_breach=not bool(safety_clamp),
                 read_max_retries=4,
                 parallel_bus_reads=True,
             )
@@ -360,11 +335,11 @@ class PolicyRobstrideDriver:
         as one wrap away.  Joints already inside (-π, +π) get a zero offset.
         """
         assert self._arm is not None
-        raw = np.zeros(12, dtype=np.float64)
+        raw = np.zeros(NUM_JOINTS, dtype=np.float64)
         for _ in range(max(1, settle_reads)):
-            raw = self._arm.read_joints12().astype(np.float64)
+            raw = self._arm.read_joints().astype(np.float64)
         adjusted: list[tuple[int, float, float]] = []
-        for i in range(12):
+        for i in range(NUM_JOINTS):
             v = float(raw[i])
             if v > np.pi:
                 self._boot_offsets[i] = 2.0 * np.pi
@@ -390,16 +365,19 @@ class PolicyRobstrideDriver:
         """Median of ``samples`` raw encoder reads (rejects single garbage CAN frames)."""
         assert self._arm is not None
         n = max(1, int(samples))
-        stack = [self._arm.read_joints12().astype(np.float64) for _ in range(n)]
+        stack = [self._arm.read_joints().astype(np.float64) for _ in range(n)]
         return stack[0] if n == 1 else np.median(np.stack(stack, axis=0), axis=0)
 
-    def read_qpos12(self) -> np.ndarray:
-        """Return the 12-DoF follower pose in the *unwrapped* (software-zero) frame."""
+    def read_qpos16(self) -> np.ndarray:
+        """Return the 16-DoF follower pose in the *unwrapped* (software-zero) frame."""
         if self._arm is None:
-            return np.zeros(12, dtype=np.float32)
+            return np.zeros(NUM_JOINTS, dtype=np.float32)
         raw = self._read_raw_encoder_median()
         self._last_raw_encoder = raw
         return ((raw - self._boot_offsets + np.pi) % (2.0 * np.pi) - np.pi).astype(np.float32)
+
+    # Back-compat alias
+    read_qpos12 = read_qpos16
 
     def verify_zero_pose(
         self,
@@ -418,11 +396,11 @@ class PolicyRobstrideDriver:
         """
         if self._arm is None or self._dry_run:
             return
-        qpos = np.zeros(12, dtype=np.float32)
+        qpos = np.zeros(NUM_JOINTS, dtype=np.float32)
         for _ in range(max(1, settle_reads)):
-            qpos = self.read_qpos12()
+            qpos = self.read_qpos16()
         bad: list[tuple[int, float]] = []
-        for i in range(12):
+        for i in range(NUM_JOINTS):
             v = float(qpos[i])
             if not (low <= v <= high):
                 bad.append((self._motor_ids[i], v))
@@ -443,24 +421,23 @@ class PolicyRobstrideDriver:
         """Seed the ramp state from current encoders so the first command does not snap."""
         if self._arm is None:
             return
-        # Seed in the motor's native (encoder) frame, since command_a12 writes in that frame.
         raw_qpos = self._read_raw_encoder_median(samples=3)
         self._arm.seed_ramp_from_angles(raw_qpos)
 
-    def command_a12(self, target12: np.ndarray) -> None:
+    def command_a16(self, target: np.ndarray) -> None:
         if self._arm is None or self._dry_run:
             return
-        t = np.asarray(target12, dtype=np.float64).reshape(-1)
-        if t.size < 12:
-            t = np.pad(t, (0, 12 - t.size))
+        t = pad_vector(target, NUM_JOINTS)
         if self._ramp_from_feedback:
-            # Re-seed the ramp from live encoders each tick (matches old behavior).
             self._arm.seed_ramp_from_angles(self._read_raw_encoder_median())
             feedback = None
         else:
             feedback = self._last_raw_encoder
         encoder_target = t + self._boot_offsets
-        self._arm.command_joints12(encoder_target, ramp=True, feedback12=feedback)
+        self._arm.command_joints(encoder_target, ramp=True, feedback12=feedback)
+
+    # Back-compat alias
+    command_a12 = command_a16
 
     def close(self) -> None:
         if self._arm is None:
@@ -477,7 +454,7 @@ class PolicyRobstrideDriver:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="GR00T ZMQ policy client (3 cam + 12 DoF)")
+    p = argparse.ArgumentParser(description="GR00T ZMQ policy client (3 cam + 16 DoF follower)")
     p.add_argument("--host", type=str, default="localhost")
     p.add_argument("--port", type=int, default=5555)
     p.add_argument("--timeout-ms", type=int, default=120000)
@@ -525,7 +502,7 @@ def main() -> None:
         "--gripper-smoothing-alpha",
         type=float,
         default=0.7,
-        help="EMA on gripper joints (indices 5, 11). Higher = smoother/slower jaw motion.",
+        help=f"EMA on gripper joints (indices {GRIPPER_JOINT_INDICES}). Higher = smoother/slower jaw motion.",
     )
     p.add_argument(
         "--max-target-step-gripper",
@@ -544,7 +521,7 @@ def main() -> None:
         "--log-every",
         type=int,
         default=1,
-        help="Print full 12-joint qpos/cmd every N control steps (1 = every step).",
+        help="Print full 16-joint qpos/cmd every N control steps (1 = every step).",
     )
     p.add_argument(
         "--log-joint-precision",
@@ -584,6 +561,11 @@ def main() -> None:
         help="Safety cap on the first command after connect (rad). Default: 1.0",
     )
     p.add_argument(
+        "--safety-abort",
+        action="store_true",
+        help="Abort+disconnect on safety breach instead of clamping (default: clamp).",
+    )
+    p.add_argument(
         "--ramp-from-feedback",
         action="store_true",
         help="Each tick, slew from measured encoder position (can oscillate if policy jitters). "
@@ -618,21 +600,21 @@ def main() -> None:
     driver: PolicyRobstrideDriver | None = None
 
     if args.robot == "demo":
-        robot = rec.DemoRobotInterface(state_dim=12, action_dim=12, image_shape=image_shape)
+        robot = rec.DemoRobotInterface(state_dim=NUM_JOINTS, action_dim=NUM_JOINTS, image_shape=image_shape)
     elif args.robot == "usb_cam":
         camera_devices = _usb_cameras.camera_cli_from_args(args)
         robot = rec.USBVideoRobotInterface(
             camera_devices=camera_devices,
-            state_dim=12,
-            action_dim=12,
+            state_dim=NUM_JOINTS,
+            action_dim=NUM_JOINTS,
             image_shape=image_shape,
         )
     else:
         camera_devices = _usb_cameras.camera_cli_from_args(args)
         robot = rec.USBVideoRobotInterface(
             camera_devices=camera_devices,
-            state_dim=12,
-            action_dim=12,
+            state_dim=NUM_JOINTS,
+            action_dim=NUM_JOINTS,
             image_shape=image_shape,
         )
         ramp_cap = None if args.policy_ramp_max_speed == 0 else args.policy_ramp_max_speed
@@ -644,6 +626,7 @@ def main() -> None:
                 auto_zero=not args.no_software_zero,
                 safety_max_delta_rad=args.safety_max_delta_rad,
                 safety_max_initial_delta_rad=args.safety_max_initial_delta_rad,
+                safety_clamp=not args.safety_abort,
             )
         except Exception as exc:
             print(f"\nERROR: failed to initialize RobStride driver: {exc}", file=sys.stderr, flush=True)
@@ -694,7 +677,7 @@ def main() -> None:
 
     if driver is not None and args.robot == "robstride" and args.apply_actions and not args.dry_run_robstride:
         driver.sync_ramped_from_feedback()
-        q0 = driver.read_qpos12()
+        q0 = driver.read_qpos16()
         if smoother is not None:
             smoother.reset(q0)
         print(
@@ -716,20 +699,20 @@ def main() -> None:
     step = 0
     chunk_queue: list[np.ndarray] = []
     chunk_plan_id = 0
-    last_cmd = np.zeros(12, dtype=np.float32)
+    last_cmd = np.zeros(NUM_JOINTS, dtype=np.float32)
 
     def fetch_observation() -> tuple[dict[str, Any], np.ndarray, dict[str, np.ndarray]]:
         raw = robot.get_observation()
-        qpos = np.asarray(raw["qpos"], dtype=np.float32).reshape(-1)
+        qpos = pad_vector(raw["qpos"], NUM_JOINTS).astype(np.float32)
         if driver is not None:
-            qpos = driver.read_qpos12()
+            qpos = driver.read_qpos16()
         obs = build_gr00t_observation(raw["images"], qpos, args.task)
         return obs, qpos, raw["images"]
 
     def plan_chunk(obs: dict[str, Any], qpos: np.ndarray) -> np.ndarray:
         nonlocal chunk_plan_id, last_cmd
         action, _info = client.get_action(obs)
-        chunk = actions_to_chunk12(action)
+        chunk = actions_to_chunk(action)
         if args.chunk_upsample > 1:
             chunk = upsample_chunk_linear(chunk, args.chunk_upsample)
         stride = args.infer_stride if args.infer_stride > 0 else chunk.shape[0]
@@ -744,16 +727,16 @@ def main() -> None:
             f"queue will have {chunk.shape[0]} steps",
             flush=True,
         )
-        print(f"  qpos  {format_joint_vector12(qpos, precision=prec)}", flush=True)
-        print(f"  target[0]  {format_joint_vector12(chunk[0], precision=prec)}", flush=True)
+        print(f"  qpos  {format_joint_vector(qpos, precision=prec)}", flush=True)
+        print(f"  target[0]  {format_joint_vector(chunk[0], precision=prec)}", flush=True)
         return chunk
 
     def execute_target(raw_target: np.ndarray) -> np.ndarray:
         nonlocal last_cmd
-        cmd = smoother.apply(raw_target) if smoother is not None else np.asarray(raw_target, dtype=np.float32)
+        cmd = smoother.apply(raw_target) if smoother is not None else pad_vector(raw_target, NUM_JOINTS).astype(np.float32)
         last_cmd = cmd.copy()
         if args.robot == "robstride" and driver is not None and args.apply_actions:
-            driver.command_a12(cmd)
+            driver.command_a16(cmd)
         return cmd
 
     def hold_last_command(reason: str, qpos: np.ndarray) -> None:
@@ -774,10 +757,11 @@ def main() -> None:
         if args.log_every <= 0 or (step % args.log_every) != 0:
             return
         if args.compact_log:
+            g_l, g_r = GRIPPER_JOINT_INDICES
             print(
                 f"step {step}  cmd[:4]={np.array2string(cmd[:4], precision=3)}  "
                 f"qpos[:4]={np.array2string(qpos[:4], precision=3)}  "
-                f"grip={cmd[5]:.3f},{cmd[11]:.3f}  {extra}",
+                f"grip={cmd[g_l]:.3f},{cmd[g_r]:.3f}  {extra}",
                 flush=True,
             )
         else:
@@ -798,7 +782,7 @@ def main() -> None:
                 if args.control_mode == "legacy":
                     try:
                         action, _info = client.get_action(obs)
-                        raw = actions_to_vector12(action, time_index=args.action_time_index)
+                        raw = actions_to_vector16(action, time_index=args.action_time_index)
                         if not np.all(np.isfinite(raw)):
                             raise ValueError("policy action contains non-finite values")
                         cmd = execute_target(raw)
@@ -815,7 +799,11 @@ def main() -> None:
 
             if chunk_queue:
                 raw_target = chunk_queue.pop(0)
-                qpos = driver.read_qpos12() if driver is not None else np.zeros(12, dtype=np.float32)
+                qpos = (
+                    driver.read_qpos16()
+                    if driver is not None
+                    else np.zeros(NUM_JOINTS, dtype=np.float32)
+                )
                 cmd = execute_target(raw_target)
                 maybe_log_step(qpos=qpos, cmd=cmd, extra=f"queue={len(chunk_queue)}")
                 step += 1

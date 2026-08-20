@@ -1,9 +1,10 @@
-# Recording + Fine-tune + Real-Hardware Validation (3-Cam, 12-DoF)
+# Recording + Fine-tune + Real-Hardware Validation (3-Cam, 16-DoF follower)
 
 This folder contains the exact workflow used for a custom 3-camera humanoid setup:
 
 - Cameras: `cam_head`, `cam_left_wrist`, `cam_right_wrist`
-- Joint layout: `12` DoF (`left_arm[5] + left_gripper[1] + right_arm[5] + right_gripper[1]`)
+- Leader: `12` Dynamixels (`5 arm + 1 gripper` per side)
+- Follower / recorded joints: `16` DoF (`7 arm + 1 gripper` per side); missing leader wrist_roll/yaw map to follower `0`
 - Raw capture format: `episode_XXXXXX.hdf5`
 - Training format: GR00T-compatible LeRobot v2.1
 - Embodiment tag: `NEW_EMBODIMENT` (registered by `record/custom_3cam_config.py`)
@@ -69,18 +70,18 @@ Verified mapping for this rig:
 
 | Role        | HDF5 / LeRobot key | USB port (`id_path_tag`)   | Typical node  |
 | ----------- | ------------------ | -------------------------- | ------------- |
-| Head        | `cam_head`         | `pci-0000_00_14_0-usb-0_8` | `/dev/video8` |
-| Left wrist  | `cam_left_wrist`   | `pci-0000_00_14_0-usb-0_9` | `/dev/video6` |
-| Right wrist | `cam_right_wrist`  | `pci-0000_00_14_0-usb-0_3` | `/dev/video0` |
+| Head        | `cam_head`         | `pci-0000_00_14_0-usb-0_2` | `/dev/video12` |
+| Left wrist  | `cam_left_wrist`   | `pci-0000_00_14_0-usb-0_3` | `/dev/video6` |
+| Right wrist | `cam_right_wrist`  | `pci-0000_00_14_0-usb-0_9` | `/dev/video1` |
 
 
 The JSON on disk:
 
 ```json
 {
-  "cam_head": {"id_path_tag": "pci-0000_00_14_0-usb-0_8"},
-  "cam_left_wrist": {"id_path_tag": "pci-0000_00_14_0-usb-0_9"},
-  "cam_right_wrist": {"id_path_tag": "pci-0000_00_14_0-usb-0_3"}
+  "cam_head": {"id_path_tag": "pci-0000_00_14_0-usb-0_2"},
+  "cam_left_wrist": {"id_path_tag": "pci-0000_00_14_0-usb-0_3"},
+  "cam_right_wrist": {"id_path_tag": "pci-0000_00_14_0-usb-0_9"}
 }
 ```
 
@@ -158,7 +159,7 @@ Notes:
 
 - `--use-usb-camera-ports` (default on Linux) loads `record/camera_ports.json` — same mapping used at inference.
 - `--teleop-rate 30`, `--dt 0.0333333`, and convert `--fps 30` must all match.
-- At ≥ 20 Hz the recorder auto-uses **2 back-to-back median reads** (no gap), zero-dropout filter only, parallel CAN reads, and `feedback12` on commands.
+- At ≥ 20 Hz the recorder auto-uses **2 back-to-back median reads** (no gap), zero-dropout filter only, parallel CAN reads, and encoder `feedback` on commands. Safety mode defaults to **clamp** (use `--safety-abort` to disconnect on breach).
 - Recording starts after the countdown and `Start teleoperating now.` message.
 - `Ctrl+C` ends current episode and saves what is captured.
 - Re-running the same command auto-increments `episode_XXXXXX.hdf5`.
@@ -224,8 +225,8 @@ uv run python record/convert_3cam_to_groot_lerobot.py \
   --raw-dir "${RAW_DIR}" \
   --repo-id "${REPO_ID}" \
   --fps 30 \
-  --state-dim 12 \
-  --action-dim 12
+  --state-dim 16 \
+  --action-dim 16
 ```
 
 `--fps` must match the record loop rate (`1 / --dt`, i.e. `30` when `--dt 0.0333333`).

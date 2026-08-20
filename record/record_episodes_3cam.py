@@ -10,8 +10,11 @@ Expected camera names:
   - cam_left_wrist
   - cam_right_wrist
 
-Expected state/action ordering (default 12D):
-  [left_arm(5), left_gripper(1), right_arm(5), right_gripper(1)]
+Expected state/action ordering (default 16D, matching direct_teleop):
+  [left_arm(7), left_gripper(1), right_arm(7), right_gripper(1)]
+
+Leader is still 5+1 Dynamixels per arm (12 total). Missing follower wrist_roll /
+wrist_yaw joints are commanded to 0 (see ``direct_teleop.leader12_to_follower16``).
 """
 
 from __future__ import annotations
@@ -57,13 +60,15 @@ class QposReadSanitizer:
         last_good_min_rad: float = 0.12,
         max_step_rad: float = 0.45,
         max_hold_ticks: int = 12,
+        state_dim: int = 16,
     ):
         self._zero_epsilon = float(zero_epsilon)
         self._last_good_min_rad = float(last_good_min_rad)
         self._max_step_rad = float(max(0.0, max_step_rad))
         self._max_hold_ticks = int(max(1, max_hold_ticks))
+        self._state_dim = max(1, int(state_dim))
         self._last_good: np.ndarray | None = None
-        self._hold_streak = np.zeros(12, dtype=np.int32)
+        self._hold_streak = np.zeros(self._state_dim, dtype=np.int32)
         self._hold_events = 0
         self._zero_holds = 0
         self._jump_holds = 0
@@ -74,11 +79,11 @@ class QposReadSanitizer:
         hz = max(control_rate_hz, 1e-3)
         return max(0.3, (float(ramp_speed_rad_s) / hz) * 1.25)
 
-    def reset(self, qpos12: np.ndarray) -> None:
-        q = np.asarray(qpos12, dtype=np.float64).reshape(-1)
-        if q.size < 12:
-            q = np.pad(q, (0, 12 - q.size))
-        self._last_good = q[:12].copy()
+    def reset(self, qpos: np.ndarray) -> None:
+        q = np.asarray(qpos, dtype=np.float64).reshape(-1)
+        if q.size < self._state_dim:
+            q = np.pad(q, (0, self._state_dim - q.size))
+        self._last_good = q[: self._state_dim].copy()
         self._hold_streak[:] = 0
 
     @property
@@ -93,17 +98,17 @@ class QposReadSanitizer:
     def jump_holds(self) -> int:
         return int(self._jump_holds)
 
-    def apply(self, qpos12: np.ndarray) -> np.ndarray:
-        q = np.asarray(qpos12, dtype=np.float64).reshape(-1)
-        if q.size < 12:
-            q = np.pad(q, (0, 12 - q.size))
-        q = q[:12].copy()
+    def apply(self, qpos: np.ndarray) -> np.ndarray:
+        q = np.asarray(qpos, dtype=np.float64).reshape(-1)
+        if q.size < self._state_dim:
+            q = np.pad(q, (0, self._state_dim - q.size))
+        q = q[: self._state_dim].copy()
         if self._last_good is None:
             self.reset(q)
             return q
 
         out = q.copy()
-        for i in range(12):
+        for i in range(self._state_dim):
             v = float(q[i])
             prev = float(self._last_good[i])
             bad_zero, bad_jump = self._bad_sample_reasons(v, prev)
@@ -206,7 +211,7 @@ class RobotInterface:
 
 
 class DemoRobotInterface(RobotInterface):
-    def __init__(self, state_dim: int = 12, action_dim: int = 12, image_shape: tuple[int, int] = (240, 424)):
+    def __init__(self, state_dim: int = 16, action_dim: int = 16, image_shape: tuple[int, int] = (240, 424)):
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.image_shape = image_shape
@@ -232,8 +237,8 @@ class USBVideoRobotInterface(RobotInterface):
     def __init__(
         self,
         camera_devices: dict[str, int | str],
-        state_dim: int = 12,
-        action_dim: int = 12,
+        state_dim: int = 16,
+        action_dim: int = 16,
         image_shape: tuple[int, int] = (240, 424),
     ):
         from usb_cameras import USBCameraRig
@@ -273,18 +278,16 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
     """
     3-camera backend + direct local teleop loop (leader Dynamixel -> follower RobStride).
 
-    Motor I/O is delegated to ``move_actuators.ActuatorController``, which handles the
-    write-then-drain-then-read pipeline with per-motor retry that was validated in
-    ``direct_teleop.py``.  This eliminates the qpos-drop-to-zero failure mode caused by
-    stale OPERATION_STATUS frames sitting in the python-can RX queue.
+    Layout matches ``direct_teleop.py``:
+      - Leader: 5 arm + 1 gripper per side (12 Dynamixels)
+      - Follower: 7 arm + 1 gripper per side (16 RobStride); wrist_roll/yaw held at 0
+
+    Motor I/O is delegated to ``move_actuators.ActuatorController`` (ramp + safety clamp).
 
     Records:
-      - qpos: follower mechanical positions (12D), read via ActuatorController.read_joints12
-      - action: ramp-limited commanded follower targets (12D), produced by command_joints12
+      - qpos: follower mechanical positions (16D)
+      - action: ramp/clamp-limited commanded follower targets (16D)
     """
-
-    LEFT_SERVO_INDICES = [0, 2, 4, 6, 8, 10]
-    RIGHT_SERVO_INDICES = [1, 3, 5, 7, 9, 11]
 
     def __init__(
         self,
@@ -295,21 +298,25 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
         qpos_median_samples: int | None = None,
         qpos_median_gap_s: float = 0.003,
         dry_run: bool = False,
+        safety_clamp: bool = True,
         image_shape: tuple[int, int] = (240, 424),
     ):
         super().__init__(
             camera_devices=camera_devices,
-            state_dim=12,
-            action_dim=12,
+            state_dim=16,
+            action_dim=16,
             image_shape=image_shape,
         )
         self._repo_root = Path(__file__).resolve().parent.parent
         if str(self._repo_root) not in sys.path:
             sys.path.insert(0, str(self._repo_root))
         import direct_teleop as dt
-        from move_actuators import ActuatorController
+        from move_actuators import ActuatorController, NUM_JOINTS, SafetyLimitBreachError
 
         self._dt = dt
+        self._SafetyLimitBreachError = SafetyLimitBreachError
+        self._num_joints = int(NUM_JOINTS)
+        self._leader_num = int(dt.LEADER_NUM_JOINTS)
         dt.ensure_import_paths(self._repo_root)
 
         from dynamixel_easy_sdk import Connector
@@ -326,11 +333,12 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
                 pass
 
         self._dry_run = bool(dry_run)
+        self._safety_clamp = bool(safety_clamp)
         self._left_motors_meta = [(f"motor_{mid}", mid) for mid in dt.LEFT_ROBSTRIDE_IDS]
         self._right_motors_meta = [(f"motor_{mid}", mid) for mid in dt.RIGHT_ROBSTRIDE_IDS]
         self._motor_ids: list[int] = list(dt.LEFT_ROBSTRIDE_IDS) + list(dt.RIGHT_ROBSTRIDE_IDS)
         # One-turn unwrap offsets in encoder frame. Reported qpos is (raw - offsets).
-        self._boot_offsets = np.zeros(12, dtype=np.float64)
+        self._boot_offsets = np.zeros(self._num_joints, dtype=np.float64)
         self._control_rate_hz = float(control_rate)
         if qpos_median_samples is None:
             # 2 back-to-back reads reject single-frame CAN spikes (~22 ms/tick at 30 Hz).
@@ -352,7 +360,10 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
                 ramp_speed_rad_s=dt.ROBSTRIDE_RAMP_MAX_SPEED_RAD_S,
             )
         )
-        self._qpos_sanitizer = QposReadSanitizer(max_step_rad=jump_limit)
+        self._qpos_sanitizer = QposReadSanitizer(
+            max_step_rad=jump_limit,
+            state_dim=self._num_joints,
+        )
 
         self._arm: ActuatorController | None = None
         if not self._dry_run:
@@ -360,10 +371,14 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
                 ramp=True,
                 ramp_max_speed_rad_s=dt.ROBSTRIDE_RAMP_MAX_SPEED_RAD_S,
                 ramp_dt_max_s=dt.ROBSTRIDE_RAMP_DT_MAX_S,
+                safety_clamp=self._safety_clamp,
+                safety_abort_on_breach=not self._safety_clamp,
                 read_max_retries=4,
                 parallel_bus_reads=True,
             )
             self._arm.connect()
+            encoders = self._arm.read_joints()
+            self._arm.seed_ramp_from_angles(encoders)
             self._capture_boot_offsets()
             # Pre-flight: refuse to record unless the follower is already at home.
             # Ensures the recorded trajectory starts from a known zero pose so we
@@ -375,8 +390,8 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
                 self._cleanup_partial_init()
                 raise
 
-        self._qpos12 = np.zeros(12, dtype=np.float32)
-        self._action12 = np.zeros(12, dtype=np.float32)
+        self._qpos16 = np.zeros(self._num_joints, dtype=np.float32)
+        self._action16 = np.zeros(self._num_joints, dtype=np.float32)
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread = threading.Thread(
@@ -385,6 +400,11 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
             daemon=True,
         )
         self._thread.start()
+        print(
+            f"[record] Teleop layout: leader {self._leader_num}D (5+1/arm) -> "
+            f"follower {self._num_joints}D (7+1/arm); safety_clamp={self._safety_clamp}",
+            flush=True,
+        )
         if self._control_rate_hz >= 20.0:
             print(
                 f"[record] High-rate qpos: median_samples={self._qpos_median_samples}, "
@@ -396,9 +416,9 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
     def _capture_boot_offsets(self, *, settle_reads: int = 3) -> None:
         """Apply one-turn software unwrap so home near 0 is represented near 0."""
         assert self._arm is not None, "ActuatorController must be connected"
-        raw = np.zeros(12, dtype=np.float64)
+        raw = np.zeros(self._num_joints, dtype=np.float64)
         for _ in range(max(1, settle_reads)):
-            raw = self._arm.read_joints12().astype(np.float64)
+            raw = self._arm.read_joints().astype(np.float64)
         adjusted: list[tuple[int, float, float]] = []
         for i, mid in enumerate(self._motor_ids):
             v = float(raw[i])
@@ -417,7 +437,7 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
         else:
             print("[record] Software zero: all joints already inside (-pi, +pi).", flush=True)
 
-    def _read_qpos12_raw(self, *, samples: int | None = None, sample_gap_s: float | None = None) -> np.ndarray:
+    def _read_qpos16_raw(self, *, samples: int | None = None, sample_gap_s: float | None = None) -> np.ndarray:
         """
         Read follower pose in unwrapped software-zero frame (no dropout filtering).
 
@@ -428,19 +448,19 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
         gap = self._qpos_median_gap_s if sample_gap_s is None else max(0.0, float(sample_gap_s))
         stack = []
         for s in range(n):
-            raw = self._arm.read_joints12().astype(np.float64)
+            raw = self._arm.read_joints().astype(np.float64)
             stack.append(raw - self._boot_offsets)
             if s + 1 < n and gap > 0.0:
                 time.sleep(gap)
         return np.median(np.stack(stack, axis=0), axis=0)
 
-    def _read_qpos12_for_command(self) -> tuple[np.ndarray, np.ndarray]:
+    def _read_qpos16_for_command(self) -> tuple[np.ndarray, np.ndarray]:
         """
         Read qpos for logging and return raw encoder feedback for the same tick.
 
         Returns:
             qpos: normalized software-zero frame for dataset logging.
-            raw_encoder: native encoder frame for ``command_joints12(feedback12=...)``.
+            raw_encoder: native encoder frame for ``command_joints(feedback12=...)``.
         """
         assert self._arm is not None
         n = self._qpos_median_samples
@@ -448,7 +468,7 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
         stack_sw: list[np.ndarray] = []
         stack_raw: list[np.ndarray] = []
         for s in range(n):
-            raw = self._arm.read_joints12().astype(np.float64)
+            raw = self._arm.read_joints().astype(np.float64)
             stack_raw.append(raw)
             stack_sw.append(raw - self._boot_offsets)
             if s + 1 < n and gap > 0.0:
@@ -462,10 +482,15 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
         qpos = _normalize_qpos_to_pi(self._qpos_sanitizer.apply(sw))
         return qpos, raw_encoder
 
-    def _read_qpos12(self) -> np.ndarray:
+    def _read_qpos16(self) -> np.ndarray:
         """Read qpos with median filtering and last-good hold for bad samples."""
-        q = self._qpos_sanitizer.apply(self._read_qpos12_raw())
+        q = self._qpos_sanitizer.apply(self._read_qpos16_raw())
         return _normalize_qpos_to_pi(q)
+
+    # Back-compat aliases used by older call sites / tools.
+    _read_qpos12_raw = _read_qpos16_raw
+    _read_qpos12_for_command = _read_qpos16_for_command
+    _read_qpos12 = _read_qpos16
 
     def _verify_zero_pose(
         self,
@@ -477,7 +502,7 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
         """
         Pre-flight check: every follower motor must be at home (qpos in [low, high]).
 
-        The first ``read_joints12`` after ``connect`` may surface stale frames; we
+        The first ``read_joints`` after ``connect`` may surface stale frames; we
         therefore read ``settle_reads`` times (drain + per-motor retry are already
         enabled inside ``ActuatorController``) and judge the last read.
 
@@ -485,9 +510,9 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
         exactly which arm joint to home before re-running.
         """
         assert self._arm is not None, "ActuatorController must be connected"
-        qpos = np.zeros(12, dtype=np.float64)
+        qpos = np.zeros(self._num_joints, dtype=np.float64)
         for _ in range(max(1, settle_reads)):
-            qpos = self._read_qpos12_raw()
+            qpos = self._read_qpos16_raw()
 
         out_of_range: list[tuple[int, float]] = []
         for i, mid in enumerate(self._motor_ids):
@@ -531,61 +556,67 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
         dt = self._dt
         period = 1.0 / max(control_rate, 1e-3)
         teleop_initialized = False
-        prev_servo = [0.0] * 12
-        accum = [0.0] * 12
-        robstride_ref = np.zeros(12, dtype=np.float64)
+        prev_servo = [0.0] * self._leader_num
+        accum = [0.0] * self._leader_num
+        robstride_ref = np.zeros(self._num_joints, dtype=np.float64)
 
         while not self._stop_event.is_set():
             t0 = time.monotonic()
-            angles = dt.get_joint_angles_from_motors(self._leader_motors)
-            a12 = dt.pad12(angles)
-            if len(angles) < 12:
-                time.sleep(period)
-                continue
+            try:
+                angles = dt.get_joint_angles_from_motors(self._leader_motors)
+                a12 = dt.pad_leader12(angles)
+                if len(angles) < self._leader_num:
+                    time.sleep(period)
+                    continue
 
-            if not teleop_initialized:
+                if not teleop_initialized:
+                    if self._arm is not None:
+                        # Keep control references in the motor's native encoder frame.
+                        # Software-unwrapped qpos is for safety checks / logging only.
+                        robstride_ref = self._arm.read_joints().astype(np.float64)
+                        self._arm.seed_ramp_from_angles(robstride_ref)
+                    prev_servo = list(a12)
+                    teleop_initialized = True
+                    # Seed published state with the initial follower pose.
+                    with self._lock:
+                        q0 = self._read_qpos16() if self._arm is not None else np.zeros(self._num_joints)
+                        self._qpos16[:] = q0.astype(np.float32)
+                        self._action16[:] = q0.astype(np.float32)
+                    continue
+
+                # Accumulate leader-side servo deltas (in raw servo units).
+                for i in range(self._leader_num):
+                    accum[i] += dt.shortest_delta_units(prev_servo[i], a12[i])
+                    prev_servo[i] = a12[i]
+
+                # Map leader 5+1/arm → follower 7+1/arm (wrist_roll/yaw forced to 0).
+                targets = dt.leader12_to_follower16(
+                    accum,
+                    robstride_ref,
+                    self._left_motors_meta,
+                    self._right_motors_meta,
+                )
+
+                # Read qpos *before* commanding so MIT status frames do not corrupt the read.
                 if self._arm is not None:
-                    # Keep control references in the motor's native encoder frame.
-                    # Software-unwrapped qpos is for safety checks / logging only.
-                    robstride_ref = self._arm.read_joints12().astype(np.float64)
-                prev_servo = list(a12)
-                teleop_initialized = True
-                # Seed published state with the initial follower pose.
+                    qpos, raw_encoder = self._read_qpos16_for_command()
+                    sent = self._arm.command_joints(targets, ramp=True, feedback12=raw_encoder)
+                    action = _normalize_qpos_to_pi(sent.astype(np.float64) - self._boot_offsets)
+                else:
+                    sent = targets
+                    qpos = np.zeros(self._num_joints, dtype=np.float64)
+                    action = qpos
+
                 with self._lock:
-                    q0 = self._read_qpos12()
-                    self._qpos12[:] = q0.astype(np.float32)
-                    self._action12[:] = q0.astype(np.float32)
-                continue
+                    self._qpos16[:] = qpos.astype(np.float32)
+                    self._action16[:] = action.astype(np.float32)
 
-            # Accumulate leader-side servo deltas (in raw servo units).
-            for i in range(12):
-                accum[i] += dt.shortest_delta_units(prev_servo[i], a12[i])
-                prev_servo[i] = a12[i]
-
-            # Compute 12-vector follower targets (initial ref + accumulated delta).
-            targets = np.zeros(12, dtype=np.float64)
-            for i, (_, motor_id) in enumerate(self._left_motors_meta):
-                servo_idx = self.LEFT_SERVO_INDICES[i]
-                d_rad = dt.accum_units_to_target_delta_rad(accum[servo_idx], motor_id, servo_idx)
-                targets[i] = robstride_ref[i] + d_rad
-            for i, (_, motor_id) in enumerate(self._right_motors_meta):
-                servo_idx = self.RIGHT_SERVO_INDICES[i]
-                d_rad = dt.accum_units_to_target_delta_rad(accum[servo_idx], motor_id, servo_idx)
-                targets[6 + i] = robstride_ref[6 + i] + d_rad
-
-            # Read qpos *before* commanding so MIT status frames do not corrupt the read.
-            if self._arm is not None:
-                qpos, raw_encoder = self._read_qpos12_for_command()
-                sent = self._arm.command_joints12(targets, ramp=True, feedback12=raw_encoder)
-                action = _normalize_qpos_to_pi(sent.astype(np.float64) - self._boot_offsets)
-            else:
-                sent = targets
-                qpos = np.zeros(12, dtype=np.float64)
-                action = qpos
-
-            with self._lock:
-                self._qpos12[:] = qpos.astype(np.float32)
-                self._action12[:] = action.astype(np.float32)
+            except self._SafetyLimitBreachError as exc:
+                print(f"[record] SAFETY ABORT: {exc}", flush=True)
+                self._stop_event.set()
+                break
+            except Exception as exc:
+                print(f"[record] teleop loop error: {exc}", flush=True)
 
             elapsed = time.monotonic() - t0
             sleep_s = period - elapsed
@@ -595,14 +626,14 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
     def get_observation(self) -> dict[str, Any]:
         obs = super().get_observation()
         with self._lock:
-            obs["qpos"] = self._qpos12.copy()
-        obs["qvel"] = np.zeros(12, dtype=np.float32)
-        obs["effort"] = np.zeros(12, dtype=np.float32)
+            obs["qpos"] = self._qpos16.copy()
+        obs["qvel"] = np.zeros(self._num_joints, dtype=np.float32)
+        obs["effort"] = np.zeros(self._num_joints, dtype=np.float32)
         return obs
 
     def get_action(self) -> np.ndarray:
         with self._lock:
-            return self._action12.copy()
+            return self._action16.copy()
 
     def close(self) -> None:
         self._stop_event.set()
@@ -807,8 +838,8 @@ def main() -> None:
     p.add_argument("--task", type=str, default="demo task")
     p.add_argument("--max-steps", type=int, default=5000)
     p.add_argument("--dt", type=float, default=1.0 / 30.0)
-    p.add_argument("--state-dim", type=int, default=12)
-    p.add_argument("--action-dim", type=int, default=12)
+    p.add_argument("--state-dim", type=int, default=16)
+    p.add_argument("--action-dim", type=int, default=16)
     p.add_argument("--image-height", type=int, default=640)
     p.add_argument("--image-width", type=int, default=640)
     p.add_argument("--robot", choices=["demo", "usb_cam", "direct_teleop"], default="demo")
@@ -828,6 +859,11 @@ def main() -> None:
         help="Gap between median samples in ms (auto 0 at teleop-rate >=20)",
     )
     p.add_argument("--dry-run-teleop", action="store_true")
+    p.add_argument(
+        "--safety-abort",
+        action="store_true",
+        help="Abort+disconnect on safety breach instead of clamping targets (default: clamp).",
+    )
     p.add_argument("--episode-idx", type=int, default=None)
     p.add_argument("--no-qvel", action="store_true")
     p.add_argument("--no-effort", action="store_true")
@@ -865,6 +901,14 @@ def main() -> None:
             image_shape=(args.image_height, args.image_width),
         )
     else:
+        if args.state_dim != 16 or args.action_dim != 16:
+            print(
+                "WARNING: direct_teleop records 16D state/action (7+1 per arm). "
+                f"Overriding dims to 16 (got state={args.state_dim}, action={args.action_dim}).",
+                flush=True,
+            )
+            args.state_dim = 16
+            args.action_dim = 16
         try:
             camera_devices = camera_cli_from_args(args)
             robot = DirectTeleopRobotInterface(
@@ -875,6 +919,7 @@ def main() -> None:
                 qpos_median_samples=args.qpos_median_samples,
                 qpos_median_gap_s=max(0.0, args.qpos_median_gap_ms / 1000.0),
                 dry_run=args.dry_run_teleop,
+                safety_clamp=not args.safety_abort,
                 image_shape=(args.image_height, args.image_width),
             )
         except RuntimeError as exc:
