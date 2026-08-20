@@ -337,7 +337,7 @@ def main():
     # --- follower arm controller via move_actuators ---
     arm: ActuatorController | None = None
     if not args.dry_run:
-        arm = ActuatorController(ramp=True)
+        arm = ActuatorController(ramp=True, safety_clamp=True, safety_abort_on_breach=False)
         arm.connect()
         # expose buses/motors for ref read and qpos logging below
         left_bus = arm._left_bus
