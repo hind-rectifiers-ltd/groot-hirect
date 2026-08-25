@@ -14,7 +14,8 @@ Expected state/action ordering (default 16D, matching direct_teleop):
   [left_arm(7), left_gripper(1), right_arm(7), right_gripper(1)]
 
 Leader is still 5+1 Dynamixels per arm (12 total). Missing follower wrist_roll /
-wrist_yaw joints are commanded to 0 (see ``direct_teleop.leader12_to_follower16``).
+wrist_yaw joints are held at the teleop-zero follower refs (see
+``direct_teleop.leader12_to_follower16``) — not absolute encoder 0.
 """
 
 from __future__ import annotations
@@ -280,7 +281,7 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
 
     Layout matches ``direct_teleop.py``:
       - Leader: 5 arm + 1 gripper per side (12 Dynamixels)
-      - Follower: 7 arm + 1 gripper per side (16 RobStride); wrist_roll/yaw held at 0
+      - Follower: 7 arm + 1 gripper per side (16 RobStride); wrist_roll/yaw held at teleop-zero refs
 
     Motor I/O is delegated to ``move_actuators.ActuatorController`` (ramp + safety clamp).
 
@@ -589,7 +590,7 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
                     accum[i] += dt.shortest_delta_units(prev_servo[i], a12[i])
                     prev_servo[i] = a12[i]
 
-                # Map leader 5+1/arm → follower 7+1/arm (wrist_roll/yaw forced to 0).
+                # Map leader 5+1/arm → follower 7+1/arm (wrists held at teleop-zero refs).
                 targets = dt.leader12_to_follower16(
                     accum,
                     robstride_ref,

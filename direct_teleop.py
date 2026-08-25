@@ -16,13 +16,19 @@ Leader vs follower layout (temporary until leader gets two more wrist servos):
 - Leader: 12 Dynamixels = 5 arm + 1 gripper per side.
 - Follower: 16 RobStride = 7 arm + 1 gripper per side
   (IDs 1,3,5,7,9,11,13,15 left / 2,4,6,8,10,12,14,16 right).
-- Follower wrist_roll / wrist_yaw (motors 11,12,13,14) are commanded to **0**.
+- Follower wrist_roll / wrist_yaw (motors 11,12,13,14) are **held at the
+  follower pose captured at teleop zero** (no leader mapping). Do **not**
+  command absolute encoder 0 — that yanks joints whose mechanical home sits
+  near ±2π or any non-zero offset.
 - Follower grippers are motors 15 (left) and 16 (right).
 
+Matches ``record/record_episodes_3cam.py``: relative leader deltas, ramp seed
+from encoders, optional zero-pose preflight, and ``feedback12`` on every
+``command_joints`` so safety clamp uses a same-tick encoder read (not a stale
+or failed-zero read after MIT writes).
+
 Optional: ``--print-follower-qpos`` uses ``record/follower_qpos_reader.py`` (retries,
-MIT status fallback, last-good per joint) like ``record/record_episodes_3cam.py``,
-and by default polls encoders **before** each MIT write burst on print ticks to
-reduce CAN contention. See ``--help`` for tuning flags.
+MIT status fallback, last-good per joint). See ``--help`` for tuning flags.
 """
 
 import argparse
@@ -86,10 +92,14 @@ LEFT_GRIPPER_MOTOR_ID = 15
 RIGHT_GRIPPER_MOTOR_ID = 16
 GRIPPER_MOTOR_IDS = {LEFT_GRIPPER_MOTOR_ID, RIGHT_GRIPPER_MOTOR_ID}
 
-# Follower wrist_roll / wrist_yaw — no leader servos yet → always command 0.
+# Follower wrist_roll / wrist_yaw — no leader servos yet → hold teleop-zero ref.
 ZERO_FOLLOWER_MOTOR_IDS = {11, 12, 13, 14}
 # Indices inside the 16-vector: left wrist_roll/yaw = 5,6 ; right = 13,14
 ZERO_FOLLOWER_INDICES = (5, 6, 13, 14)
+
+# Pre-flight: follower joints must be near home (same window as record_episodes_3cam).
+ZERO_POSE_LOW_RAD = -0.2
+ZERO_POSE_HIGH_RAD = 0.2
 
 # Leader 5+1 → which follower joint index (within one arm's 8 slots) each maps to.
 # Follower arm order: shoulder_pitch, shoulder_roll, shoulder_yaw, elbow_roll,
@@ -143,7 +153,11 @@ def leader12_to_follower16(
     """
     Map leader 12-DoF accumulated deltas + follower refs → 16-DoF command vector.
 
-    Motors 11/12/13/14 (wrist_roll / wrist_yaw) are forced to absolute 0.0.
+    All follower joints are **relative to** ``robstride_ref16`` (pose at teleop
+    zero). Wrist_roll / wrist_yaw have no leader servos, so they stay at that
+    ref (held). Never write absolute encoder 0 for those joints — mechanical
+    home is often a small offset or a ±2π wrap, and absolute 0 yanks the wrist.
+
     Grippers 15/16 are driven from leader servo indices 10/11.
     """
     accum = np.asarray(accum12, dtype=np.float64).reshape(-1)
@@ -158,7 +172,7 @@ def leader12_to_follower16(
         ref = np.asarray(robstride_ref16, dtype=np.float64).reshape(-1)
         return float(ref[fallback_idx]) if fallback_idx < len(ref) else 0.0
 
-    # Left arm: leader 5+1 → follower slots 0..4 and 7; slots 5,6 = 0
+    # Left arm: leader 5+1 → follower slots 0..4 and 7; wrists 5,6 held at ref
     for leader_i, follower_i in enumerate(LEADER_TO_FOLLOWER_ARM_INDEX):
         motor_name, motor_id = left_motors[follower_i]
         servo_idx = LEFT_LEADER_SERVO_INDICES[leader_i]
@@ -177,11 +191,43 @@ def leader12_to_follower16(
             float(accum[servo_idx]), motor_id, servo_idx
         )
 
-    # Explicitly park missing wrist DoFs (motors 11,12,13,14).
+    # Park missing wrist DoFs at teleop-zero follower ref (relative hold).
     for idx in ZERO_FOLLOWER_INDICES:
-        targets[idx] = 0.0
+        if idx < ARM_DOF:
+            motor_name, _ = left_motors[idx]
+        else:
+            motor_name, _ = right_motors[idx - ARM_DOF]
+        targets[idx] = _ref(motor_name, idx)
 
     return targets
+
+
+def verify_follower_zero_pose(
+    qpos16: np.ndarray | list | tuple,
+    motor_ids: list[int],
+    *,
+    low: float = ZERO_POSE_LOW_RAD,
+    high: float = ZERO_POSE_HIGH_RAD,
+) -> None:
+    """Raise RuntimeError if any follower joint is outside [low, high] rad."""
+    q = np.asarray(qpos16, dtype=np.float64).reshape(-1)
+    out_of_range: list[tuple[int, float]] = []
+    n = min(len(q), len(motor_ids))
+    for i in range(n):
+        v = float(q[i])
+        if not (low <= v <= high):
+            out_of_range.append((int(motor_ids[i]), v))
+    if out_of_range:
+        details = "\n".join(
+            f"  motor id {mid} is not zero (qpos={v:+.4f} rad, allowed range [{low}, {high}])"
+            for mid, v in out_of_range
+        )
+        raise RuntimeError(
+            "Follower pre-teleop zero-pose check failed:\n"
+            + details
+            + "\nMove the follower arm(s) back to home position (~0 rad) and re-run, "
+            "or pass --skip-zero-pose (wrists will still hold teleop-zero refs)."
+        )
 
 
 def ramp_toward(current: float, desired: float, max_step: float) -> float:
@@ -304,6 +350,17 @@ def main():
     parser.add_argument("--follower-mit-sweep-timeout-s", type=float, default=0.4)
     parser.add_argument("--follower-mit-sweep-max-frames", type=int, default=320)
     parser.add_argument("--verbose-follower-can-reads", action="store_true")
+    parser.add_argument(
+        "--skip-zero-pose",
+        action="store_true",
+        help="Skip follower home check before live teleop (record always enforces this). "
+             "Wrist joints still hold the pose captured at teleop zero (relative), not absolute 0.",
+    )
+    parser.add_argument(
+        "--safety-abort",
+        action="store_true",
+        help="Abort and disconnect on safety breach instead of clamping (default: clamp like record).",
+    )
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parent
@@ -323,7 +380,7 @@ def main():
     print(f"Found {len(leader_motors)} leader motors: {[m.id for m in leader_motors]}")
     print(
         f"Follower layout: {NUM_JOINTS} DoF (7+1 per arm). "
-        f"Zeroing wrist motors {sorted(ZERO_FOLLOWER_MOTOR_IDS)}; "
+        f"Holding wrist motors {sorted(ZERO_FOLLOWER_MOTOR_IDS)} at teleop-zero refs; "
         f"grippers = {sorted(GRIPPER_MOTOR_IDS)}."
     )
 
@@ -337,13 +394,39 @@ def main():
     # --- follower arm controller via move_actuators ---
     arm: ActuatorController | None = None
     if not args.dry_run:
-        arm = ActuatorController(ramp=True, safety_clamp=True, safety_abort_on_breach=False)
+        arm = ActuatorController(
+            ramp=True,
+            ramp_max_speed_rad_s=ROBSTRIDE_RAMP_MAX_SPEED_RAD_S,
+            ramp_dt_max_s=ROBSTRIDE_RAMP_DT_MAX_S,
+            safety_clamp=not args.safety_abort,
+            safety_abort_on_breach=bool(args.safety_abort),
+            read_max_retries=4,
+            parallel_bus_reads=True,
+        )
         arm.connect()
         # expose buses/motors for ref read and qpos logging below
         left_bus = arm._left_bus
         right_bus = arm._right_bus
         left_motors = arm._left_motors
         right_motors = arm._right_motors
+        # Same as record: seed ramp from encoders so first command does not snap.
+        encoders = arm.read_joints()
+        arm.seed_ramp_from_angles(encoders)
+        if not args.skip_zero_pose:
+            # Drain a few reads (first frame after connect can be stale).
+            qpos = encoders
+            for _ in range(3):
+                qpos = arm.read_joints()
+            motor_ids = [mid for _, mid in left_motors] + [mid for _, mid in right_motors]
+            try:
+                verify_follower_zero_pose(qpos, motor_ids)
+                qpos_str = ", ".join(f"{float(v):+.4f}" for v in qpos)
+                print(f"[direct] Follower zero-pose check OK: qpos=[{qpos_str}]")
+            except RuntimeError:
+                arm.disconnect(send_zero=False)
+                raise
+        else:
+            print("[direct] Skipping follower zero-pose check (--skip-zero-pose).")
     else:
         left_bus = right_bus = None
         left_motors = [(f"motor_{mid}", mid) for mid in LEFT_ROBSTRIDE_IDS]
@@ -401,25 +484,23 @@ def main():
                         robstride_ref[motor_name] = float(refs[i])
                     for i, (motor_name, _) in enumerate(right_motors):
                         robstride_ref[motor_name] = float(refs[ARM_DOF + i])
+                    # Keep control references in the motor's native encoder frame
+                    # (same as record_episodes_3cam).
+                    arm.seed_ramp_from_angles(refs)
                 else:
                     for motor_name, _ in left_motors + right_motors:
                         robstride_ref[motor_name] = 0.0
-                # seed arm ramp state from the refs
-                if arm is not None:
-                    for motor_name, _ in left_motors:
-                        arm._ramped[motor_name] = robstride_ref.get(motor_name, 0.0)
-                    for motor_name, _ in right_motors:
-                        arm._ramped[motor_name] = robstride_ref.get(motor_name, 0.0)
                 prev_servo = list(a12)
                 teleop_initialized = True
                 last_ramp_t = time.monotonic()
-                print("Teleop zero set: captured follower refs.")
+                print("Teleop zero set: captured follower refs (relative deltas from here).")
                 print(
-                    "  Note: follower wrist_roll/yaw (motors 11,12,13,14) will be commanded to 0."
+                    "  Note: follower wrist_roll/yaw (motors 11,12,13,14) held at those refs "
+                    "(not absolute encoder 0)."
                 )
                 continue
 
-            # --- accumulate leader deltas ---
+            # --- accumulate leader deltas (raw Dynamixel units, shortest path) ---
             for i in range(LEADER_NUM_JOINTS):
                 accum[i] += shortest_delta_units(prev_servo[i], a12[i])
                 prev_servo[i] = a12[i]
@@ -427,25 +508,28 @@ def main():
             now = time.monotonic()
             if last_ramp_t is None:
                 last_ramp_t = now
-            dt = max(1e-4, min(now - last_ramp_t, ROBSTRIDE_RAMP_DT_MAX_S))
             last_ramp_t = now
-            _ = ROBSTRIDE_RAMP_MAX_SPEED_RAD_S * dt  # ramp handled inside ActuatorController
 
-            # --- compute 16-vector desired targets (zero wrist_roll/yaw) ---
+            # --- compute 16-vector desired targets (wrists hold teleop-zero refs) ---
             targets = leader12_to_follower16(accum, robstride_ref, left_motors, right_motors)
 
-            # --- optional pre-write qpos read ---
+            # --- optional diagnostic qpos (before writes when requested) ---
             will_print = args.print_every > 0 and (loops + 1) % args.print_every == 0
             qpos_log: np.ndarray | None = None
             if will_print and args.print_follower_qpos and qpos_reader is not None and follower_qpos_read_before_writes:
-                # Reader API still named read_qpos12; it walks left_motors/right_motors lists.
                 qpos_log = qpos_reader.read_qpos12(
                     left_bus, right_bus, left_motors, right_motors, _caller="direct_before_writes"
                 )
 
-            # --- send to motors via ActuatorController ---
+            # --- send to motors: same-tick encoder feedback for safety (like record) ---
+            raw_encoder: np.ndarray | None = None
             if arm is not None:
-                arm.command_joints(targets, ramp=True)
+                try:
+                    raw_encoder = arm.read_joints()
+                except Exception as e:
+                    print(f"[direct] encoder read failed before command: {e}")
+                    raw_encoder = None
+                arm.command_joints(targets, ramp=True, feedback12=raw_encoder)
             ramped_cmd = arm._ramped if arm is not None else {}
 
             # --- optional post-write qpos read ---
@@ -462,10 +546,10 @@ def main():
                     preview = {k: round(v, 4) for k, v in list(ramped_cmd.items())[:4]}
                     msg += f" | target_preview={preview}"
                 print(msg)
-                # Simple follower line (matches scripts/read_follower_joints.py behavior).
+                # Simple follower line — reuse same-tick read when available.
                 if not args.no_print_follower and arm is not None:
                     try:
-                        fq = arm.read_joints()
+                        fq = raw_encoder if raw_encoder is not None else arm.read_joints()
                         prec = max(0, args.print_follower_precision)
                         follower_str = ", ".join(f"{float(v):.{prec}f}" for v in fq)
                         print(f"             follower[:{NUM_JOINTS}]=[{follower_str}]")
@@ -476,7 +560,11 @@ def main():
                     qpos16 = (
                         np.asarray(qpos_log, dtype=np.float64).reshape(-1)
                         if qpos_log is not None
-                        else np.zeros(NUM_JOINTS, dtype=np.float64)
+                        else (
+                            np.asarray(raw_encoder, dtype=np.float64).reshape(-1)
+                            if raw_encoder is not None
+                            else np.zeros(NUM_JOINTS, dtype=np.float64)
+                        )
                     )
                     if qpos16.size < NUM_JOINTS:
                         qpos16 = np.pad(qpos16, (0, NUM_JOINTS - qpos16.size))
