@@ -608,6 +608,7 @@ def main() -> None:
             state_dim=NUM_JOINTS,
             action_dim=NUM_JOINTS,
             image_shape=image_shape,
+            camera_fps=float(args.camera_fps),
         )
     else:
         camera_devices = _usb_cameras.camera_cli_from_args(args)
@@ -616,6 +617,7 @@ def main() -> None:
             state_dim=NUM_JOINTS,
             action_dim=NUM_JOINTS,
             image_shape=image_shape,
+            camera_fps=float(args.camera_fps),
         )
         ramp_cap = None if args.policy_ramp_max_speed == 0 else args.policy_ramp_max_speed
         try:

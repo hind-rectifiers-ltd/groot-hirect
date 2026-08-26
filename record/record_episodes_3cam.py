@@ -241,6 +241,7 @@ class USBVideoRobotInterface(RobotInterface):
         state_dim: int = 16,
         action_dim: int = 16,
         image_shape: tuple[int, int] = (240, 424),
+        camera_fps: float = 30.0,
     ):
         from usb_cameras import USBCameraRig
 
@@ -249,7 +250,7 @@ class USBVideoRobotInterface(RobotInterface):
         self.image_shape = image_shape
         self._qpos = np.zeros(self.state_dim, dtype=np.float32)
         self._action = np.zeros(self.action_dim, dtype=np.float32)
-        self._camera_rig = USBCameraRig(camera_devices, image_shape)
+        self._camera_rig = USBCameraRig(camera_devices, image_shape, fps=camera_fps)
 
     def set_state_action(self, qpos: np.ndarray | None = None, action: np.ndarray | None = None) -> None:
         if qpos is not None:
@@ -301,12 +302,14 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
         dry_run: bool = False,
         safety_clamp: bool = True,
         image_shape: tuple[int, int] = (240, 424),
+        camera_fps: float = 30.0,
     ):
         super().__init__(
             camera_devices=camera_devices,
             state_dim=16,
             action_dim=16,
             image_shape=image_shape,
+            camera_fps=camera_fps,
         )
         self._repo_root = Path(__file__).resolve().parent.parent
         if str(self._repo_root) not in sys.path:
@@ -900,6 +903,7 @@ def main() -> None:
             state_dim=args.state_dim,
             action_dim=args.action_dim,
             image_shape=(args.image_height, args.image_width),
+            camera_fps=float(args.camera_fps),
         )
     else:
         if args.state_dim != 16 or args.action_dim != 16:
@@ -922,6 +926,7 @@ def main() -> None:
                 dry_run=args.dry_run_teleop,
                 safety_clamp=not args.safety_abort,
                 image_shape=(args.image_height, args.image_width),
+                camera_fps=float(args.camera_fps),
             )
         except RuntimeError as exc:
             # Pre-flight zero-pose check (or other init validation) failed: print and exit

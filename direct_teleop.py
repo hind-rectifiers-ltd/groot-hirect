@@ -33,6 +33,7 @@ MIT status fallback, last-good per joint). See ``--help`` for tuning flags.
 
 import argparse
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -243,6 +244,18 @@ def ensure_import_paths(project_root: Path) -> None:
     src = project_root / "src"
     if src.is_dir() and str(src) not in sys.path:
         sys.path.insert(0, str(src))
+
+    # Leader Dynamixel stack lives in sibling teleop_websocket (or TELEOP_PROJECT_ROOT).
+    teleop_roots = []
+    env_root = os.environ.get("TELEOP_PROJECT_ROOT", "").strip()
+    if env_root:
+        teleop_roots.append(Path(env_root))
+    teleop_roots.append(project_root.parent / "teleop_websocket")
+    for root in teleop_roots:
+        teleop_src = root / "src"
+        if teleop_src.is_dir() and str(teleop_src) not in sys.path:
+            sys.path.insert(0, str(teleop_src))
+            break
 
     record_dir = project_root / "record"
     if record_dir.is_dir() and str(record_dir) not in sys.path:

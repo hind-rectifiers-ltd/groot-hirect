@@ -20,6 +20,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -389,14 +390,27 @@ def print_working_cameras() -> None:
         print(f"{entry['path']} -> {format_camera_identity_line(entry.get('identity') or {})}")
 
 
-def configure_capture(cap, width: int, height: int, *, prefer_mjpeg: bool = True) -> None:
+def configure_capture(
+    cap,
+    width: int,
+    height: int,
+    *,
+    prefer_mjpeg: bool = True,
+    fps: float | None = None,
+    buffer_size: int = 2,
+) -> None:
     import cv2
 
     if prefer_mjpeg:
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    if fps is not None and fps > 0:
+        cap.set(cv2.CAP_PROP_FPS, float(fps))
+    # BUFFERSIZE=1 drops frames on heavier MJPEG streams (e.g. Arducam Low Light
+    # head) when decode is slower than the USB interval — measured ~half FPS.
+    # 2+ keeps pace with wrist cams on the same hub.
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, max(1, int(buffer_size)))
 
 
 def device_to_path(dev: int | str) -> str:
@@ -525,6 +539,17 @@ def add_three_camera_cli_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Cycle through every working camera with its USB port id (for building camera_ports.json).",
     )
+    parser.add_argument(
+        "--camera-fps",
+        type=float,
+        default=30.0,
+        help=(
+            "UVC capture FPS (default 30, matches Record_Flow 30 Hz). "
+            "On a shared USB 2.0 hub three cams often cannot sustain 30; "
+            "the rig auto-falls back to 15, or pass --camera-fps 15. "
+            "For true 30 FPS, put cams on USB 3 (lsusb -t → Bus 02)."
+        ),
+    )
 
 
 def camera_cli_from_args(args: argparse.Namespace) -> dict[str, int | str]:
@@ -545,6 +570,7 @@ def _annotate_preview_frame(
     title: str,
     subtitle: str,
     banner_bgr: tuple[int, int, int],
+    fps_text: str | None = None,
 ) -> np.ndarray:
     import cv2
 
@@ -562,6 +588,18 @@ def _annotate_preview_frame(
         2,
         cv2.LINE_AA,
     )
+    if fps_text:
+        (tw, th), _ = cv2.getTextSize(fps_text, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+        cv2.putText(
+            out,
+            fps_text,
+            (max(8, w - tw - 10), bar_h - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
     if subtitle:
         cv2.putText(
             out,
@@ -581,6 +619,7 @@ def run_camera_mapping_preview(
     *,
     image_shape: tuple[int, int] = (480, 640),
     window_name: str = "GR00T: verify camera_ports.json (Esc=quit)",
+    fps: float = 30.0,
 ) -> None:
     """
     Show HEAD | LEFT WRIST | RIGHT WRIST side-by-side using the resolved device map.
@@ -594,29 +633,65 @@ def run_camera_mapping_preview(
         "cam_left_wrist": (180, 100, 30),
         "cam_right_wrist": (30, 90, 200),
     }
-    rig = USBCameraRig(device_map, image_shape, prefer_mjpeg=False)
-    print("Preview open. Check each panel matches HEAD / LEFT WRIST / RIGHT WRIST.", flush=True)
+    # Target 30 FPS (Record_Flow). USBCameraRig falls back to 15 if the hub saturates.
+    rig = USBCameraRig(device_map, image_shape, prefer_mjpeg=True, fps=fps)
+    # Cache udev identity once — querying every frame adds noticeable GUI lag.
+    role_meta: dict[str, tuple[str, str]] = {}
+    for role in THREE_CAM_ROLES:
+        dev = device_map[role]
+        path = device_to_path(dev)
+        ident = get_camera_identity(path) if isinstance(path, str) else {}
+        tag = ident.get("id_path_tag", "?")
+        role_meta[role] = (path, tag)
+
+    print(
+        f"Preview open (target capture fps={rig.fps}). "
+        "Check each panel matches HEAD / LEFT WRIST / RIGHT WRIST.",
+        flush=True,
+    )
     print("Press Esc in the preview window to quit.", flush=True)
+
+    ui_frames = 0
+    ui_t0 = time.time()
+    ui_fps = 0.0
     try:
         while True:
             panels: list[np.ndarray] = []
             for role in THREE_CAM_ROLES:
                 rgb = rig.read_rgb(role)
                 bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-                dev = device_map[role]
-                path = device_to_path(dev)
-                ident = get_camera_identity(path) if isinstance(path, str) else {}
-                tag = ident.get("id_path_tag", "?")
+                path, tag = role_meta[role]
+                cam_fps = rig.measured_fps(role)
                 subtitle = f"{path}  instance={tag}"
+                fps_text = f"{cam_fps:4.1f} fps"
                 panels.append(
                     _annotate_preview_frame(
                         bgr,
                         title=ROLE_DISPLAY_LABELS.get(role, role),
                         subtitle=subtitle,
                         banner_bgr=banner_colors.get(role, (80, 80, 80)),
+                        fps_text=fps_text,
                     )
                 )
             strip = np.hstack(panels)
+            ui_frames += 1
+            now = time.time()
+            elapsed = now - ui_t0
+            if elapsed >= 0.5:
+                ui_fps = ui_frames / elapsed
+                ui_frames = 0
+                ui_t0 = now
+            # Overall UI refresh rate (bottom-left of the strip).
+            cv2.putText(
+                strip,
+                f"UI {ui_fps:4.1f} fps | target {rig.fps:g}",
+                (10, strip.shape[0] - 28),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (40, 220, 40),
+                2,
+                cv2.LINE_AA,
+            )
             cv2.imshow(window_name, strip)
             key = cv2.waitKey(1) & 0xFF
             if key == 27:
@@ -652,7 +727,7 @@ def run_preview_all_working_cameras(*, image_shape: tuple[int, int] = (480, 640)
                 print(f"Skip {path} (not opened)")
                 idx += 1
                 continue
-            configure_capture(cap, w, h, prefer_mjpeg=False)
+            configure_capture(cap, w, h, prefer_mjpeg=True, fps=30.0)
             try:
                 while True:
                     ret, frame = cap.read()
@@ -701,7 +776,11 @@ def run_camera_preview_from_args(args: argparse.Namespace) -> None:
             flush=True,
         )
         raise SystemExit(2) from exc
-    run_camera_mapping_preview(device_map, image_shape=shape)
+    run_camera_mapping_preview(
+        device_map,
+        image_shape=shape,
+        fps=float(getattr(args, "camera_fps", 30.0)),
+    )
 
 
 def handle_camera_list_flags(args: argparse.Namespace) -> bool:
@@ -718,8 +797,65 @@ def handle_camera_list_flags(args: argparse.Namespace) -> bool:
     return False
 
 
+class _CameraGrabber(threading.Thread):
+    """Continuously pull frames from one VideoCapture so read_rgb() is non-blocking."""
+
+    def __init__(self, cap: Any, name: str):
+        super().__init__(name=f"cam-grab-{name}", daemon=True)
+        self._cap = cap
+        self._name = name
+        self._lock = threading.Lock()
+        self._frame: np.ndarray | None = None
+        self._stop_event = threading.Event()
+        self._ok = 0
+        self._fail = 0
+        self._fps_window_start = time.time()
+        self._fps_window_ok = 0
+        self._measured_fps = 0.0
+
+    def run(self) -> None:
+        while not self._stop_event.is_set():
+            # grab()+retrieve() avoids OpenCV read() dropping every other frame on
+            # some UVC MJPEG devices when the decode path is slower than the stream.
+            if not self._cap.grab():
+                self._fail += 1
+                time.sleep(0.002)
+                continue
+            ret, frame = self._cap.retrieve()
+            if ret and frame is not None and getattr(frame, "size", 0) > 0:
+                with self._lock:
+                    self._frame = frame
+                self._ok += 1
+                self._fps_window_ok += 1
+                now = time.time()
+                elapsed = now - self._fps_window_start
+                if elapsed >= 0.5:
+                    self._measured_fps = self._fps_window_ok / elapsed
+                    self._fps_window_ok = 0
+                    self._fps_window_start = now
+            else:
+                self._fail += 1
+                time.sleep(0.002)
+
+    def latest(self) -> np.ndarray | None:
+        with self._lock:
+            if self._frame is None:
+                return None
+            return self._frame.copy()
+
+    @property
+    def measured_fps(self) -> float:
+        return float(self._measured_fps)
+
+    def request_stop(self) -> None:
+        self._stop_event.set()
+
+
 class USBCameraRig:
     """Open and read a fixed set of named USB cameras."""
+
+    # When multi-cam @ 30 FPS fails on a saturated USB 2.0 hub, retry at this rate.
+    USB2_FALLBACK_FPS = 15.0
 
     def __init__(
         self,
@@ -727,6 +863,9 @@ class USBCameraRig:
         image_shape: tuple[int, int],
         *,
         prefer_mjpeg: bool | None = None,
+        fps: float | None = None,
+        threaded: bool = True,
+        allow_usb2_fps_fallback: bool = True,
     ):
         try:
             import cv2
@@ -735,13 +874,56 @@ class USBCameraRig:
 
         self._cv2 = cv2
         self.image_shape = image_shape
+        self._device_map = dict(device_map)
         self._caps: dict[str, Any] = {}
-        multi = len(device_map) > 1
+        self._grabbers: dict[str, _CameraGrabber] = {}
+        self._threaded = threaded
+        # Default MJPEG for all opens. Multi-cam on a shared USB 2.0 hub cannot
+        # sustain uncompressed YUYV; the last camera typically goes black.
         if prefer_mjpeg is None:
-            prefer_mjpeg = not multi
+            prefer_mjpeg = True
+        self._prefer_mjpeg = prefer_mjpeg
+        # Match Record_Flow 30 Hz / 30 fps by default. If the shared USB 2.0 hub
+        # cannot sustain it, we auto-fall back to 15 FPS (see below).
+        multi = len(device_map) > 1
+        if fps is None:
+            fps = 30.0 if multi else None
+        self.fps = fps
 
-        h, w = image_shape
-        for cam_name, dev in device_map.items():
+        self._open_all(fps=fps)
+        if threaded:
+            missing = self._start_grabbers_and_warmup()
+            if (
+                missing
+                and allow_usb2_fps_fallback
+                and fps is not None
+                and fps > self.USB2_FALLBACK_FPS
+            ):
+                print(
+                    f"[usb_cameras] WARNING: no frames from {missing} at {fps:g} FPS. "
+                    f"Shared USB 2.0 hub is likely saturated. Falling back to "
+                    f"{self.USB2_FALLBACK_FPS:g} FPS.\n"
+                    "  For Record_Flow **30 FPS**, move at least one camera to a USB 3 "
+                    "port (`lsusb -t` → Bus 02 / 5000M–10000M), then re-run with "
+                    "`--camera-fps 30` and update camera_ports.json if paths change.",
+                    flush=True,
+                )
+                self._stop_grabbers()
+                self._release_caps()
+                self.fps = self.USB2_FALLBACK_FPS
+                self._open_all(fps=self.fps)
+                missing = self._start_grabbers_and_warmup()
+                if missing:
+                    print(
+                        f"[usb_cameras] WARNING: still no frames from {missing} "
+                        f"at {self.fps:g} FPS. Check cables / power / USB topology.",
+                        flush=True,
+                    )
+
+    def _open_all(self, *, fps: float | None) -> None:
+        h, w = self.image_shape
+        multi = len(self._device_map) > 1
+        for cam_name, dev in self._device_map.items():
             path = device_to_path(dev) if isinstance(dev, int) else str(dev)
             cap = open_capture(dev)
             if not cap.isOpened():
@@ -749,16 +931,63 @@ class USBCameraRig:
                 cap = open_capture(path)
             if not cap.isOpened():
                 raise RuntimeError(f"Failed to open camera {cam_name} at {path}")
-            configure_capture(cap, w, h, prefer_mjpeg=prefer_mjpeg)
+            # Head (Arducam Low Light) needs a deeper V4L buffer under multi-cam
+            # load or MJPEG decode drops frames (~half FPS). Wrist cams keep
+            # buffer=1 so a requested 15 FPS cap still sticks on this USB 2 hub.
+            buf = 3 if cam_name == "cam_head" else 1
+            configure_capture(
+                cap,
+                w,
+                h,
+                prefer_mjpeg=self._prefer_mjpeg,
+                fps=fps,
+                buffer_size=buf,
+            )
             self._caps[cam_name] = cap
             time.sleep(0.2)
+        print(
+            f"[usb_cameras] Opened {len(self._caps)} cameras "
+            f"(mjpeg={self._prefer_mjpeg}, fps={fps}, threaded={self._threaded})",
+            flush=True,
+        )
+
+    def _start_grabbers_and_warmup(self) -> list[str]:
+        for cam_name, cap in self._caps.items():
+            grabber = _CameraGrabber(cap, cam_name)
+            grabber.start()
+            self._grabbers[cam_name] = grabber
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            if all(g.latest() is not None for g in self._grabbers.values()):
+                break
+            time.sleep(0.05)
+        return [n for n, g in self._grabbers.items() if g.latest() is None]
+
+    def _stop_grabbers(self) -> None:
+        for grabber in self._grabbers.values():
+            grabber.request_stop()
+        for grabber in self._grabbers.values():
+            grabber.join(timeout=2.0)
+        self._grabbers.clear()
+
+    def _release_caps(self) -> None:
+        for cap in self._caps.values():
+            cap.release()
+        self._caps.clear()
 
     def read_rgb(self, cam_name: str) -> np.ndarray:
         cv2 = self._cv2
         h, w = self.image_shape
-        cap = self._caps[cam_name]
-        ret, frame = cap.read()
-        if not ret or frame is None:
+        frame: np.ndarray | None = None
+        grabber = self._grabbers.get(cam_name)
+        if grabber is not None:
+            frame = grabber.latest()
+        else:
+            cap = self._caps[cam_name]
+            ret, got = cap.read()
+            if ret and got is not None:
+                frame = got
+        if frame is None:
             return np.zeros((h, w, 3), dtype=np.uint8)
         if frame.shape[:2] != (h, w):
             frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_LINEAR)
@@ -767,7 +996,12 @@ class USBCameraRig:
     def read_all_rgb(self, camera_names: tuple[str, ...]) -> dict[str, np.ndarray]:
         return {cam: self.read_rgb(cam) for cam in camera_names}
 
+    def measured_fps(self, cam_name: str) -> float:
+        grabber = self._grabbers.get(cam_name)
+        if grabber is None:
+            return 0.0
+        return grabber.measured_fps
+
     def close(self) -> None:
-        for cap in self._caps.values():
-            cap.release()
-        self._caps.clear()
+        self._stop_grabbers()
+        self._release_caps()

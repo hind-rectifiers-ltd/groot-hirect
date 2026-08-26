@@ -59,29 +59,45 @@ export CKPT="${FT_OUT}/checkpoint-10000"
 #   export CKPT="$(ls -d "${FT_OUT}"/checkpoint-* | sort -V | tail -n1)"
 ```
 
+Jetson (T7 mounted under `/media/jetson`):
+
+```bash
+export SSD=/media/jetson/T7/pick_place_v1
+export RAW_DIR="${SSD}/pick_place"
+export REPO_ID=hirect_humanoid/pickplace_3cam
+export HF_LEROBOT_HOME="${SSD}/lerobot"
+export LEROBOT_ROOT="${HF_LEROBOT_HOME}"
+export DS="${LEROBOT_ROOT}/${REPO_ID}"
+export FT_OUT="${SSD}/outputs/gr00t_custom_3cam"
+export HF_HOME="${SSD}/huggingface"
+export CKPT="${FT_OUT}/checkpoint-10000"
+# Tip: auto-pick the latest checkpoint after training:
+#   export CKPT="$(ls -d "${FT_OUT}"/checkpoint-* | sort -V | tail -n1)"
+```
+
 `HF_LEROBOT_HOME` is what the LeRobot converter uses; `HF_HOME` routes large Hugging Face / Transformers downloads (e.g. base model) to the SSD. `FT_OUT` is the training output directory and `CKPT` points to one specific checkpoint inside it — use `"${CKPT}"` everywhere the README needs a checkpoint path. Update the checkpoint number whenever you train further (or use the `ls`-based tip above).
 
 ### Camera setup (USB ports, not `/dev/videoN`)
 
 On Linux, **do not rely on numeric camera indices** (`/dev/video0`, `/dev/video8`, …) — they change across reboots. Instead, cameras are pinned by **physical USB port** in `record/camera_ports.json` and resolved automatically when `--use-usb-camera-ports` is set (default on Linux for record + policy client).
 
-Verified mapping for this rig:
+Verified mapping for this Jetson rig (from `--preview-all-cameras`):
 
 
-| Role        | HDF5 / LeRobot key | USB port (`id_path_tag`)   | Typical node  |
-| ----------- | ------------------ | -------------------------- | ------------- |
-| Head        | `cam_head`         | `pci-0000_00_14_0-usb-0_2` | `/dev/video12` |
-| Left wrist  | `cam_left_wrist`   | `pci-0000_00_14_0-usb-0_3` | `/dev/video6` |
-| Right wrist | `cam_right_wrist`  | `pci-0000_00_14_0-usb-0_9` | `/dev/video1` |
+| Role        | HDF5 / LeRobot key | USB port (`id_path_tag`)           | Typical node |
+| ----------- | ------------------ | ---------------------------------- | ------------ |
+| Head        | `cam_head`         | `platform-3610000_usb-usb-0_4_3`   | `/dev/video8` |
+| Left wrist  | `cam_left_wrist`   | `platform-3610000_usb-usb-0_4_1`   | `/dev/video0` |
+| Right wrist | `cam_right_wrist`  | `platform-3610000_usb-usb-0_4_2`   | `/dev/video4` |
 
 
 The JSON on disk:
 
 ```json
 {
-  "cam_head": {"id_path_tag": "pci-0000_00_14_0-usb-0_2"},
-  "cam_left_wrist": {"id_path_tag": "pci-0000_00_14_0-usb-0_3"},
-  "cam_right_wrist": {"id_path_tag": "pci-0000_00_14_0-usb-0_9"}
+  "cam_head": {"id_path_tag": "platform-3610000_usb-usb-0_4_3"},
+  "cam_left_wrist": {"id_path_tag": "platform-3610000_usb-usb-0_4_1"},
+  "cam_right_wrist": {"id_path_tag": "platform-3610000_usb-usb-0_4_2"}
 }
 ```
 
@@ -109,6 +125,8 @@ Edit `record/camera_ports.json`, then run `preview_three_cameras.py` again until
 
 Override a single role without editing JSON: `--video-cam-head /dev/video8`. Disable USB pinning: `--no-use-usb-camera-ports` plus explicit `--video-cam-*` indices.
 
+> **Black panel with 3 cams open, but OK one-at-a-time:** All three cams on this Jetson currently share one **USB 2.0** hub (`lsusb -t` → Bus 01 @ 480M). Record_Flow targets **`--camera-fps 30`** (same clock as `--teleop-rate 30` / `--dt 0.0333333`). If the hub cannot sustain 30 FPS, `USBCameraRig` **auto-falls back to 15 FPS** and prints a warning. For true **30 FPS** on Jetson: plug at least one camera into a **USB 3** port (Bus 02 @ 5000M–10000M), re-run `--preview-all-cameras`, update `camera_ports.json`, then verify with `preview_three_cameras.py` (log should say `fps=30` with no fallback warning).
+
 ---
 
 ## 1) Record episodes (v2 flow input)
@@ -122,12 +140,13 @@ Keep **motors, camera sampling, conversion fps, and deployment rate** on the sam
 | ---------------------------------------------- | ----------------------- | -------------------------------- |
 | Follower teleop                                | `--teleop-rate`         | `30`                             |
 | Record loop (images + `qpos`/`action` logging) | `--dt`                  | `0.0333333` (~30 Hz)             |
+| UVC camera capture                             | `--camera-fps`          | `30` (auto-falls back to 15 on saturated USB 2.0 hub) |
 | Qpos filtering at 30 Hz                        | `--qpos-median-samples` | `2` (auto when teleop-rate ≥ 20) |
 | LeRobot convert                                | `--fps`                 | `30`                             |
 | Policy client                                  | `--rate-hz`             | `30`                             |
 
 
-USB cameras may run faster internally; the recorder grabs **one frame per `--dt` tick**. Do **not** mix rates (e.g. `--dt 0.1` with `--teleop-rate 30`) — that misaligns vision and joints in training data.
+USB cameras should stream at **`--camera-fps 30`** so each `--dt` tick gets a fresh frame. Do **not** mix rates (e.g. `--dt 0.1` with `--teleop-rate 30`) — that misaligns vision and joints in training data. On this Jetson, all three cams on one USB 2.0 hub cannot sustain 30 FPS; move a cam to USB 3 (see [Camera setup](#camera-setup-usb-ports-not-devvideon)) before production recording.
 
 Validate CAN on the robot before your first 30 Hz session (arm still, both buses up):
 
@@ -150,6 +169,7 @@ uv run python record/record_episodes_3cam.py \
   --leader-baud 57600 \
   --teleop-rate 30 \
   --dt 0.0333333 \
+  --camera-fps 30 \
   --qpos-median-samples 2 \
   --use-usb-camera-ports \
   --task "pick up the object and place it in the tray"
@@ -158,7 +178,7 @@ uv run python record/record_episodes_3cam.py \
 Notes:
 
 - `--use-usb-camera-ports` (default on Linux) loads `record/camera_ports.json` — same mapping used at inference.
-- `--teleop-rate 30`, `--dt 0.0333333`, and convert `--fps 30` must all match.
+- `--teleop-rate 30`, `--dt 0.0333333`, `--camera-fps 30`, and convert `--fps 30` must all match. If the log shows a USB 2.0 fallback to 15 FPS, move a camera to USB 3 before production demos.
 - At ≥ 20 Hz the recorder auto-uses **2 back-to-back median reads** (no gap), zero-dropout filter only, parallel CAN reads, and encoder `feedback` on commands. Safety mode defaults to **clamp** (use `--safety-abort` to disconnect on breach).
 - Recording starts after the countdown and `Start teleoperating now.` message.
 - `Ctrl+C` ends current episode and saves what is captured.

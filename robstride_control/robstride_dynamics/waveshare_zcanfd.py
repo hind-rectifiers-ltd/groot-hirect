@@ -36,28 +36,41 @@ INVALID_CHANNEL_HANDLE = 0
 TYPE_CAN = 0
 TYPE_CANFD = 1
 
+# __file__ is robstride_control/robstride_dynamics/waveshare_zcanfd.py
+# repo root = ../../  (NOT ../../../ which escapes into projects/)
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 _DEFAULT_LIB_CANDIDATES = [
     os.environ.get("WAVESHARE_ZCANFD_LIB", ""),
+    # Jetson / aarch64 SDK build (built from Jetson-nano/python3/libcontrolcanfd.a)
     os.path.join(
-        os.path.dirname(__file__),
-        "..",
-        "..",
-        "..",
+        _REPO_ROOT,
+        "USB-CAN-FD-B-Linux",
+        "Jetson-nano",
+        "python3",
+        "libcontrolcanfd.so",
+    ),
+    os.path.join(
+        _REPO_ROOT,
+        "USB-CAN-FD-B-Linux",
+        "Raspberry",
+        "python3",
+        "libcontrolcanfd.so",
+    ),
+    os.path.join(
+        _REPO_ROOT,
         "USB-CAN-FD-B-Linux",
         "VMware",
         "x86-python3",
         "libcontrolcanfd.so",
     ),
     os.path.join(
-        os.path.dirname(__file__),
-        "..",
-        "..",
-        "..",
+        _REPO_ROOT,
         "USB-CAN-FD-B-Linux",
         "VMware",
         "x86-c",
         "libcontrolcanfd.so",
     ),
+    os.path.join(_REPO_ROOT, "scripts", "libcontrolcanfd.so"),
     "./libcontrolcanfd.so",
 ]
 
