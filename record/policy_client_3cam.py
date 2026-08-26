@@ -245,14 +245,9 @@ def _import_usb_cameras():
 class PolicyRobstrideDriver:
     """Minimal follower commander: ramped MIT targets via ``ActuatorController`` (no leader teleop).
 
-    Adds two safety features for inference:
-      * **Software auto-zero**: at connect, any joint reading > +π or < -π (i.e. the multi-turn
-        encoder reported one wrap away from home) gets a one-turn offset.  All subsequent reads
-        return the unwrapped value, and all commands have the offset added back before being
-        sent to the motor.  This makes the policy see a clean ``≈0 rad`` home pose even after
-        a power cycle wraps the encoder.
-      * **Zero-pose check** (:meth:`verify_zero_pose`): refuse to start inference unless every
-        joint (after software unwrap) sits within ``[-0.2, +0.2] rad``.
+    Uses the same joint read/command pipeline as record: logical frame =
+    directed MECHANICAL_POSITION minus fixed one-turn home offsets captured at
+    connect. :meth:`verify_zero_pose` requires home near 0 in that frame.
     """
 
     def __init__(
@@ -288,11 +283,9 @@ class PolicyRobstrideDriver:
         self._ramp_from_feedback = ramp_from_feedback
         self._ramp_max_speed_rad_s = ramp_max_speed_rad_s
         self._motor_ids: list[int] = list(LEFT_ROBSTRIDE_IDS) + list(RIGHT_ROBSTRIDE_IDS)
-        # One-turn-unwrap offsets in the motor's encoder frame: read_qpos returns
-        # (raw - boot_offsets); command_a sends (target + boot_offsets).
-        self._boot_offsets: np.ndarray = np.zeros(NUM_JOINTS, dtype=np.float64)
-        self._last_raw_encoder: np.ndarray | None = None
+        self._last_qpos: np.ndarray | None = None
         self._arm: ActuatorController | None = None
+        _ = auto_zero  # connect() always captures one-turn offsets
 
         if not dry_run:
             ramp_speed = (
@@ -313,10 +306,7 @@ class PolicyRobstrideDriver:
             )
             try:
                 self._arm.connect()
-                if auto_zero:
-                    self._capture_boot_offsets()
             except Exception:
-                # Make sure we release CAN buses if anything blew up mid-init
                 try:
                     self._arm.disconnect(send_zero=False)
                 except Exception:
@@ -324,57 +314,17 @@ class PolicyRobstrideDriver:
                 self._arm = None
                 raise
 
-    # -- internal helpers -------------------------------------------------
-
-    def _capture_boot_offsets(self, *, settle_reads: int = 3) -> None:
-        """Detect one-turn encoder ambiguity and store per-joint offsets.
-
-        On power-up the RobStride multi-turn encoder can land ±2π away from the
-        true home position even when the joint is physically at zero.  We
-        compensate in software: any reading whose magnitude exceeds π is treated
-        as one wrap away.  Joints already inside (-π, +π) get a zero offset.
-        """
+    def _read_qpos_median(self, *, samples: int = 2) -> np.ndarray:
         assert self._arm is not None
-        raw = np.zeros(NUM_JOINTS, dtype=np.float64)
-        for _ in range(max(1, settle_reads)):
-            raw = self._arm.read_joints().astype(np.float64)
-        adjusted: list[tuple[int, float, float]] = []
-        for i in range(NUM_JOINTS):
-            v = float(raw[i])
-            if v > np.pi:
-                self._boot_offsets[i] = 2.0 * np.pi
-            elif v < -np.pi:
-                self._boot_offsets[i] = -2.0 * np.pi
-            else:
-                self._boot_offsets[i] = 0.0
-            if abs(self._boot_offsets[i]) > 0:
-                adjusted.append((self._motor_ids[i], v, v - self._boot_offsets[i]))
-        if adjusted:
-            print("[policy_client] Software zero: one-turn unwrap applied to:", flush=True)
-            for mid, before, after in adjusted:
-                print(
-                    f"  motor id {mid}: encoder={before:+.4f} rad → reported as {after:+.4f} rad",
-                    flush=True,
-                )
-        else:
-            print("[policy_client] Software zero: all joints already inside (-π, +π).", flush=True)
-
-    # -- public API used by main() ---------------------------------------
-
-    def _read_raw_encoder_median(self, *, samples: int = 2) -> np.ndarray:
-        """Median of ``samples`` raw encoder reads (rejects single garbage CAN frames)."""
-        assert self._arm is not None
-        n = max(1, int(samples))
-        stack = [self._arm.read_joints().astype(np.float64) for _ in range(n)]
-        return stack[0] if n == 1 else np.median(np.stack(stack, axis=0), axis=0)
+        return self._arm.read_joints(samples=max(1, int(samples)))
 
     def read_qpos16(self) -> np.ndarray:
-        """Return the 16-DoF follower pose in the *unwrapped* (software-zero) frame."""
+        """Return the 16-DoF follower pose in the logical frame (same as record)."""
         if self._arm is None:
             return np.zeros(NUM_JOINTS, dtype=np.float32)
-        raw = self._read_raw_encoder_median()
-        self._last_raw_encoder = raw
-        return ((raw - self._boot_offsets + np.pi) % (2.0 * np.pi) - np.pi).astype(np.float32)
+        q = self._read_qpos_median()
+        self._last_qpos = q
+        return q.astype(np.float32)
 
     # Back-compat alias
     read_qpos12 = read_qpos16
@@ -421,20 +371,20 @@ class PolicyRobstrideDriver:
         """Seed the ramp state from current encoders so the first command does not snap."""
         if self._arm is None:
             return
-        raw_qpos = self._read_raw_encoder_median(samples=3)
-        self._arm.seed_ramp_from_angles(raw_qpos)
+        q = self._read_qpos_median(samples=3)
+        self._arm.seed_ramp_from_angles(q)
 
     def command_a16(self, target: np.ndarray) -> None:
         if self._arm is None or self._dry_run:
             return
         t = pad_vector(target, NUM_JOINTS)
         if self._ramp_from_feedback:
-            self._arm.seed_ramp_from_angles(self._read_raw_encoder_median())
+            self._arm.seed_ramp_from_angles(self._read_qpos_median())
             feedback = None
         else:
-            feedback = self._last_raw_encoder
-        encoder_target = t + self._boot_offsets
-        self._arm.command_joints(encoder_target, ramp=True, feedback12=feedback)
+            feedback = self._last_qpos
+        # Logical in / logical out — ActuatorController adds one-turn offsets on write.
+        self._arm.command_joints(t, ramp=True, feedback12=feedback)
 
     # Back-compat alias
     command_a12 = command_a16
@@ -574,8 +524,7 @@ def main() -> None:
     p.add_argument(
         "--no-software-zero",
         action="store_true",
-        help="Disable the one-turn-unwrap software zero applied to RobStride encoders at start. "
-        "Use only if you have already re-zeroed the motors with vendor tools.",
+        help="Deprecated no-op (one-turn home unwrap is always applied inside ActuatorController).",
     )
     p.add_argument(
         "--zero-check-low",

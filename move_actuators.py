@@ -389,27 +389,20 @@ class ActuatorController:
         desired12: np.ndarray,
         *,
         feedback12: np.ndarray | list | tuple | None = None,
+        previous12: np.ndarray | list | tuple | None = None,
     ) -> np.ndarray:
         """
-        Check each ramp-limited target against the live encoder and either abort
-        or clamp when it jumps too far.
+        Cap each joint's next command to ``previous ± limit``.
 
-        Uses shortest angular distance so joints near ±2π (e.g. encoder 6.25 rad vs
-        0.02 rad) are treated as ~0.05 rad apart, not ~6.2 rad.
+        Reference is the last commanded value (ramp state), **not** the encoder.
+        If the incoming target jumps by more than ``safety_max_delta_rad`` from
+        the previous command, the written target becomes
+        ``previous + sign(delta) * limit`` — never more than the clamp step.
 
-        Behaviour on breach:
-          * ``safety_clamp=True``  → clamp target to ``encoder ± limit`` and continue
-          * ``safety_clamp=False`` → raise :class:`SafetyLimitBreachError` (and
-            disconnect if ``safety_abort_on_breach``)
+        On the first command after connect, if no previous state is available,
+        ``feedback12`` (or a live read) is used as the reference once.
 
-        Args:
-            feedback12: Optional encoder-frame joint vector from a read in the same
-                        control tick. When provided, skips a second ``read_joints``
-                        call (saves ~10 ms per command at 30 Hz).
-
-        Returns:
-            Target vector to command — unchanged when within limits, or clamped
-            per joint when ``safety_clamp`` is enabled.
+        With ``safety_clamp=False``, a breach raises instead of saturating.
         """
         desired = _pad12(desired12)
         if not self._safety_enabled:
@@ -426,33 +419,39 @@ class ActuatorController:
         if limit <= 0.0:
             return desired
 
-        if feedback12 is not None:
-            current = _pad12(feedback12)
+        if previous12 is not None:
+            previous = _pad12(previous12)
+        elif feedback12 is not None:
+            previous = _pad12(feedback12)
         else:
-            current = self.read_joints()
+            previous = self.read_joints()
+
         breaches: list[tuple[int, float, float, float]] = []
+
         for i in range(NUM_JOINTS):
             if not self._joint_bus_live(i):
                 continue
             mid = JOINT_MOTOR_IDS[i]
             if mid in self._safety_excluded_motor_ids:
                 continue
-            enc = float(current[i])
+            prev = float(previous[i])
             tgt = float(desired[i])
-            signed = _shortest_delta_rad(tgt, enc)
-            if abs(signed) > limit:
-                breaches.append((mid, enc, tgt, abs(signed)))
-                if self._safety_clamp:
-                    desired[i] = enc + math.copysign(limit, signed)
+            signed = _shortest_delta_rad(tgt, prev)
+            if abs(signed) <= limit:
+                continue
+            breaches.append((mid, prev, tgt, abs(signed)))
+            if self._safety_clamp:
+                # Saturate to previous ± clamp — never chase encoder.
+                desired[i] = prev + math.copysign(limit, signed)
 
         if not breaches:
             return desired
 
         which = "first command after connect" if self._safety_command_count == 1 else "command tick"
         details = "\n".join(
-            f"  motor id {mid}: encoder={enc:+.4f} rad  target={tgt:+.4f} rad  "
-            f"|delta|={delta:+.4f} rad  (limit {limit:.4f})"
-            for mid, enc, tgt, delta in breaches
+            f"  motor id {mid}: previous={prev:+.4f} rad  target={tgt:+.4f} rad  "
+            f"|delta|={delta:+.4f} rad  → clamped to ±{limit:.4f} from previous"
+            for mid, prev, tgt, delta in breaches
         )
 
         if self._safety_clamp:
@@ -460,17 +459,18 @@ class ActuatorController:
             if now - self._last_safety_warn_t > 1.0:
                 self._last_safety_warn_t = now
                 print(
-                    "[move_actuators] safety clamp active — capping "
-                    f"{len(breaches)} joint(s) to ±{limit:.3f} rad ({which}):\n" + details,
+                    "[move_actuators] safety clamp — capping "
+                    f"{len(breaches)} joint(s) to ±{limit:.3f} rad from last command "
+                    f"({which}):\n" + details,
                     flush=True,
                 )
             return desired
 
         msg = (
-            "Safety limits breached: joint target jump too large in encoder frame "
+            "Safety limits breached: joint target jump too large "
             f"({which}).\n"
             + details
-            + "\nRefusing to command motors. Check frame/unwrapping and homing."
+            + "\nRefusing to command motors."
         )
         if self._safety_abort_on_breach:
             try:
@@ -537,22 +537,28 @@ class ActuatorController:
         max_step = self._ramp_max_speed * ramp_dt if use_ramp else float("inf")
 
         sent = np.zeros(NUM_JOINTS, dtype=np.float64)
+        previous = np.zeros(NUM_JOINTS, dtype=np.float64)
 
         for i, (name, _mid) in enumerate(self._left_motors):
             desired = float(q[i])
-            target = _ramp_toward(self._ramped.get(name, desired), desired, max_step)
+            prev = float(self._ramped.get(name, desired))
+            previous[i] = prev
+            target = _ramp_toward(prev, desired, max_step)
             self._ramped[name] = target
             sent[i] = target
 
         for i, (name, _mid) in enumerate(self._right_motors):
             desired = float(q[ARM_DOF + i])
-            target = _ramp_toward(self._ramped.get(name, desired), desired, max_step)
+            prev = float(self._ramped.get(name, desired))
+            previous[ARM_DOF + i] = prev
+            target = _ramp_toward(prev, desired, max_step)
             self._ramped[name] = target
             sent[ARM_DOF + i] = target
 
-        # Safety applies to ramp-limited targets actually sent, not the full policy horizon.
-        # In clamp mode this returns per-joint capped targets instead of raising.
-        sent = self._enforce_command_safety(sent, feedback12=feedback12)
+        # Safety: never rewrite commands toward a bad encoder sample.
+        sent = self._enforce_command_safety(
+            sent, feedback12=feedback12, previous12=previous
+        )
         for i, (name, _mid) in enumerate(self._left_motors):
             self._ramped[name] = float(sent[i])
         for i, (name, _mid) in enumerate(self._right_motors):
@@ -725,7 +731,7 @@ class ActuatorController:
         _ = last_exc  # kept for future debugging
         return 0.0
 
-    def read_joints(self, *, drain_rx: bool = True) -> np.ndarray:
+    def read_joints(self, *, drain_rx: bool = True, samples: int = 1) -> np.ndarray:
         """
         Read MECHANICAL_POSITION for all 16 joints.  Failed reads stay 0.0.
 
@@ -733,7 +739,15 @@ class ActuatorController:
             drain_rx: If True (default), flush stale frames from each bus's RX queue
                       before issuing register reads.  Strongly recommended when called
                       after ``command_joints`` on the same bus.
+            samples: If >1, return the per-joint median of that many reads (record uses 2).
         """
+        n = max(1, int(samples))
+        if n == 1:
+            return self._read_joints_once(drain_rx=drain_rx)
+        stack = [self._read_joints_once(drain_rx=drain_rx) for _ in range(n)]
+        return np.median(np.stack(stack, axis=0), axis=0)
+
+    def _read_joints_once(self, *, drain_rx: bool = True) -> np.ndarray:
         if not self._connected:
             raise RuntimeError("[move_actuators] Not connected.")
         with self._read_stats_lock:

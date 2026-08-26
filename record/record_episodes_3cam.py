@@ -34,17 +34,6 @@ import numpy as np
 CAMERA_NAMES = ("cam_head", "cam_left_wrist", "cam_right_wrist")
 
 
-def _normalize_qpos_to_pi(qpos: np.ndarray) -> np.ndarray:
-    """
-    Wrap joint angles to [-pi, pi) for dataset storage.
-
-    This is a final safety-net for wrapped encoder values (~2*pi at physical zero).
-    Commanding still uses the motor-native frame elsewhere.
-    """
-    q = np.asarray(qpos, dtype=np.float64)
-    return ((q + np.pi) % (2.0 * np.pi)) - np.pi
-
-
 class QposReadSanitizer:
     """
     Hold last-good qpos when a CAN read is clearly invalid.
@@ -341,8 +330,6 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
         self._left_motors_meta = [(f"motor_{mid}", mid) for mid in dt.LEFT_ROBSTRIDE_IDS]
         self._right_motors_meta = [(f"motor_{mid}", mid) for mid in dt.RIGHT_ROBSTRIDE_IDS]
         self._motor_ids: list[int] = list(dt.LEFT_ROBSTRIDE_IDS) + list(dt.RIGHT_ROBSTRIDE_IDS)
-        # One-turn unwrap offsets in encoder frame. Reported qpos is (raw - offsets).
-        self._boot_offsets = np.zeros(self._num_joints, dtype=np.float64)
         self._control_rate_hz = float(control_rate)
         if qpos_median_samples is None:
             # 2 back-to-back reads reject single-frame CAN spikes (~22 ms/tick at 30 Hz).
@@ -381,9 +368,9 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
                 parallel_bus_reads=True,
             )
             self._arm.connect()
-            encoders = self._arm.read_joints()
+            # connect() already captures one-turn home offsets (same rule as before).
+            encoders = self._arm.read_joints(samples=self._qpos_median_samples)
             self._arm.seed_ramp_from_angles(encoders)
-            self._capture_boot_offsets()
             # Pre-flight: refuse to record unless the follower is already at home.
             # Ensures the recorded trajectory starts from a known zero pose so we
             # do not save ramp-from-arbitrary-pose noise as the first frames.
@@ -417,79 +404,33 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
                 flush=True,
             )
 
-    def _capture_boot_offsets(self, *, settle_reads: int = 3) -> None:
-        """Apply one-turn software unwrap so home near 0 is represented near 0."""
-        assert self._arm is not None, "ActuatorController must be connected"
-        raw = np.zeros(self._num_joints, dtype=np.float64)
-        for _ in range(max(1, settle_reads)):
-            raw = self._arm.read_joints().astype(np.float64)
-        adjusted: list[tuple[int, float, float]] = []
-        for i, mid in enumerate(self._motor_ids):
-            v = float(raw[i])
-            if v > np.pi:
-                self._boot_offsets[i] = 2.0 * np.pi
-            elif v < -np.pi:
-                self._boot_offsets[i] = -2.0 * np.pi
-            else:
-                self._boot_offsets[i] = 0.0
-            if self._boot_offsets[i] != 0.0:
-                adjusted.append((mid, v, v - self._boot_offsets[i]))
-        if adjusted:
-            print("[record] Software zero: one-turn unwrap applied to:", flush=True)
-            for mid, before, after in adjusted:
-                print(f"  motor id {mid}: encoder={before:+.4f} rad -> reported as {after:+.4f} rad", flush=True)
-        else:
-            print("[record] Software zero: all joints already inside (-pi, +pi).", flush=True)
-
     def _read_qpos16_raw(self, *, samples: int | None = None, sample_gap_s: float | None = None) -> np.ndarray:
         """
-        Read follower pose in unwrapped software-zero frame (no dropout filtering).
+        Read follower pose via ``ActuatorController.read_joints`` (logical frame).
 
-        Takes the per-joint median of ``samples`` reads to reject single garbage frames.
+        Median / one-turn home unwrap live inside move_actuators — same path as safety.
+        ``sample_gap_s`` is kept for API compatibility; high-rate record uses gap 0.
         """
         assert self._arm is not None
         n = max(1, int(samples if samples is not None else self._qpos_median_samples))
-        gap = self._qpos_median_gap_s if sample_gap_s is None else max(0.0, float(sample_gap_s))
-        stack = []
-        for s in range(n):
-            raw = self._arm.read_joints().astype(np.float64)
-            stack.append(raw - self._boot_offsets)
-            if s + 1 < n and gap > 0.0:
-                time.sleep(gap)
-        return np.median(np.stack(stack, axis=0), axis=0)
+        _ = sample_gap_s  # median is internal to read_joints(samples=n)
+        return self._arm.read_joints(samples=n)
 
     def _read_qpos16_for_command(self) -> tuple[np.ndarray, np.ndarray]:
         """
-        Read qpos for logging and return raw encoder feedback for the same tick.
+        One logical-frame read for logging and for ``command_joints(feedback12=...)``.
 
-        Returns:
-            qpos: normalized software-zero frame for dataset logging.
-            raw_encoder: native encoder frame for ``command_joints(feedback12=...)``.
+        Same vector for both — avoids record vs safety frame mismatch.
         """
         assert self._arm is not None
-        n = self._qpos_median_samples
-        gap = self._qpos_median_gap_s
-        stack_sw: list[np.ndarray] = []
-        stack_raw: list[np.ndarray] = []
-        for s in range(n):
-            raw = self._arm.read_joints().astype(np.float64)
-            stack_raw.append(raw)
-            stack_sw.append(raw - self._boot_offsets)
-            if s + 1 < n and gap > 0.0:
-                time.sleep(gap)
-        if n == 1:
-            raw_encoder = stack_raw[0]
-            sw = stack_sw[0]
-        else:
-            raw_encoder = np.median(np.stack(stack_raw, axis=0), axis=0)
-            sw = np.median(np.stack(stack_sw, axis=0), axis=0)
-        qpos = _normalize_qpos_to_pi(self._qpos_sanitizer.apply(sw))
-        return qpos, raw_encoder
+        q = self._arm.read_joints(samples=self._qpos_median_samples)
+        qpos = self._qpos_sanitizer.apply(q)
+        # Feedback uses the same logical read as qpos before hold-filter (safety frame).
+        return qpos, q.copy()
 
     def _read_qpos16(self) -> np.ndarray:
         """Read qpos with median filtering and last-good hold for bad samples."""
-        q = self._qpos_sanitizer.apply(self._read_qpos16_raw())
-        return _normalize_qpos_to_pi(q)
+        return self._qpos_sanitizer.apply(self._read_qpos16_raw())
 
     # Back-compat aliases used by older call sites / tools.
     _read_qpos12_raw = _read_qpos16_raw
@@ -575,9 +516,10 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
 
                 if not teleop_initialized:
                     if self._arm is not None:
-                        # Keep control references in the motor's native encoder frame.
-                        # Software-unwrapped qpos is for safety checks / logging only.
-                        robstride_ref = self._arm.read_joints().astype(np.float64)
+                        # Logical frame from ActuatorController (same as qpos / safety).
+                        robstride_ref = self._arm.read_joints(
+                            samples=self._qpos_median_samples
+                        ).astype(np.float64)
                         self._arm.seed_ramp_from_angles(robstride_ref)
                     prev_servo = list(a12)
                     teleop_initialized = True
@@ -603,9 +545,9 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
 
                 # Read qpos *before* commanding so MIT status frames do not corrupt the read.
                 if self._arm is not None:
-                    qpos, raw_encoder = self._read_qpos16_for_command()
-                    sent = self._arm.command_joints(targets, ramp=True, feedback12=raw_encoder)
-                    action = _normalize_qpos_to_pi(sent.astype(np.float64) - self._boot_offsets)
+                    qpos, feedback = self._read_qpos16_for_command()
+                    sent = self._arm.command_joints(targets, ramp=True, feedback12=feedback)
+                    action = np.asarray(sent, dtype=np.float64)
                 else:
                     sent = targets
                     qpos = np.zeros(self._num_joints, dtype=np.float64)
@@ -823,7 +765,6 @@ def record_episode(
         for cam in CAMERA_NAMES:
             img_grp.create_dataset(cam, data=np.asarray(imgs[cam], dtype=np.uint8), compression="gzip")
         qpos_arr = np.asarray(obs_qpos, dtype=np.float32)
-        qpos_arr = _normalize_qpos_to_pi(qpos_arr).astype(np.float32)
         obs_grp.create_dataset("qpos", data=qpos_arr)
         root.create_dataset("action", data=np.asarray(act, dtype=np.float32))
         if include_qvel and obs_qvel:

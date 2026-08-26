@@ -422,13 +422,12 @@ def main():
         left_motors = arm._left_motors
         right_motors = arm._right_motors
         # Same as record: seed ramp from encoders so first command does not snap.
-        encoders = arm.read_joints()
+        encoders = arm.read_joints(samples=3)
         arm.seed_ramp_from_angles(encoders)
         if not args.skip_zero_pose:
-            # Drain a few reads (first frame after connect can be stale).
             qpos = encoders
             for _ in range(3):
-                qpos = arm.read_joints()
+                qpos = arm.read_joints(samples=2)
             motor_ids = [mid for _, mid in left_motors] + [mid for _, mid in right_motors]
             try:
                 verify_follower_zero_pose(qpos, motor_ids)
@@ -491,7 +490,7 @@ def main():
             # --- teleop zero: capture follower refs on first valid sample ---
             if not teleop_initialized:
                 if arm is not None and (left_bus or right_bus):
-                    refs = arm.read_joints()
+                    refs = arm.read_joints(samples=2)
                     for i, (motor_name, _) in enumerate(left_motors):
                         robstride_ref[motor_name] = float(refs[i])
                     for i, (motor_name, _) in enumerate(right_motors):
@@ -537,7 +536,7 @@ def main():
             raw_encoder: np.ndarray | None = None
             if arm is not None:
                 try:
-                    raw_encoder = arm.read_joints()
+                    raw_encoder = arm.read_joints(samples=2)
                 except Exception as e:
                     print(f"[direct] encoder read failed before command: {e}")
                     raw_encoder = None
