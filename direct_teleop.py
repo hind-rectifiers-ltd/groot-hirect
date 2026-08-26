@@ -47,11 +47,10 @@ import numpy as np
 SERVO_UNITS_PER_REV = 4096.0
 RAD_PER_SERVO_UNIT = 2.0 * math.pi / SERVO_UNITS_PER_REV
 
-# Leader Dynamixel → follower gripper gain. Left finger travel is short (~0.5 rad),
-# so use a lower scale than the right (still under separate testing).
-GRIPPER_MOTION_SCALE = 5.0          # default / right gripper
-LEFT_GRIPPER_MOTION_SCALE = 1.0     # left gripper only (motor 15 / leader servo 10)
-RIGHT_GRIPPER_MOTION_SCALE = GRIPPER_MOTION_SCALE
+# Leader Dynamixel → follower gripper gain (same on both sides; right verified correct).
+GRIPPER_MOTION_SCALE = 5.0
+LEFT_GRIPPER_MOTION_SCALE = GRIPPER_MOTION_SCALE   # motor 15 / leader servo 10
+RIGHT_GRIPPER_MOTION_SCALE = GRIPPER_MOTION_SCALE  # motor 16 / leader servo 11
 # Leader Dynamixel indices for left/right grippers in the 12-vector pad order.
 LEFT_GRIPPER_SERVO_INDEX = 10
 RIGHT_GRIPPER_SERVO_INDEX = 11

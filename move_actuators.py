@@ -110,10 +110,10 @@ MOTOR_TORQUE_LIMIT: dict[int, float] = {
 #
 # Motor 8 = right arm elbow_roll (RIGHT_ROBSTRIDE_IDS index 3).
 MOTOR_DIRECTION: dict[int, float] = {
-    1: 1.0, 2: 1.0, 3: 1.0, 4: 1.0, 5: 1.0, 6: 1.0, 7: -1.0,
-    8: -1.0,                                        # right elbow_roll (inverted mounting)
+    1: 1.0, 2: 1.0, 3: 1.0, 4: 1.0, 5: 1.0, 6: 1.0, 7: 1.0,
+    8: 1.0,                                        # right elbow_roll (inverted mounting)
     9: 1.0, 10: 1.0, 11: -1.0, 12: -1.0, 13: 1.0, 14: 1.0,
-    15: 1.0, 16: 1.0,
+    15: 1.0, 16: -1.0,
 }
 
 # Per-motor "software zero": the joint angle (rad, logical frame) the motor sits
