@@ -2,11 +2,11 @@
 """
 Passive follower joint reader: poll joints via ``ActuatorController.read_joints``.
 
-Uses the same pipeline as record / teleop / safety:
-  MECHANICAL_POSITION → MOTOR_DIRECTION → one-turn home unwrap → optional median.
+Uses the same pipeline as record / teleop / safety (start-pose logical frame).
 
-Default: connect (enables, captures home-turn offsets), then **disable** torque so
-you can backdrive by hand. If reads fail after disable, try ``--keep-torque-enabled``.
+Default: **read-only connect** — opens CAN, does **not** enable torque / MODE / MIT
+hold, so motors should not jerk. Use ``--keep-torque-enabled`` only if you need
+the motors enabled (they will hold start pose).
 
 Example:
   uv run python scripts/read_follower_joints.py --rate-hz 10
@@ -64,7 +64,7 @@ def main() -> None:
     p.add_argument(
         "--keep-torque-enabled",
         action="store_true",
-        help="Do not disable torque after connect (motors may resist hand motion).",
+        help="Enable torque and hold start pose (default: pure read-only, no enable).",
     )
     p.add_argument("--precision", type=int, default=4, help="Decimals for line/table output")
     p.add_argument(
@@ -82,26 +82,15 @@ def main() -> None:
     )
     args = p.parse_args()
 
-    arm = ActuatorController(safety_enabled=False, parallel_bus_reads=True, read_max_retries=4)
+    arm = ActuatorController(
+        safety_enabled=False,
+        parallel_bus_reads=True,
+        read_max_retries=4,
+        enable_torque=bool(args.keep_torque_enabled),
+    )
     arm.connect()
-
     if not args.keep_torque_enabled:
-        print(
-            "Disabling motor torque for passive hand motion (use --keep-torque-enabled to skip).",
-            flush=True,
-        )
-        for bus, motors in (
-            (arm._left_bus, arm._left_motors),
-            (arm._right_bus, arm._right_motors),
-        ):
-            if bus is None:
-                continue
-            for motor_name, _ in motors:
-                try:
-                    bus.disable(motor_name)
-                except Exception as e:
-                    print(f"  disable {motor_name}: {e}", file=sys.stderr)
-                time.sleep(0.02)
+        print("Read-only mode: motors not enabled (no torque / no MIT hold).", flush=True)
 
     period = 1.0 / max(float(args.rate_hz), 0.25)
     prec = max(0, int(args.precision))

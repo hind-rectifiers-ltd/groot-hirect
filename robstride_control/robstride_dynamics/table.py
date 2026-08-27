@@ -10,15 +10,15 @@ import numpy as np
 
 
 MODEL_MIT_POSITION_TABLE = {
-    "rs-00": 1 * np.pi,
-    "rs-01": 1 * np.pi,
-    "rs-02": 1 * np.pi,
-    "rs-03": 1 * np.pi,
-    "rs-04": 1 * np.pi,
-    "rs-05": 1 * np.pi,
-    "rs-06": 1 * np.pi,
+    "rs-00": 4 * np.pi,
+    "rs-01": 4 * np.pi,
+    "rs-02": 4 * np.pi,
+    "rs-03": 4 * np.pi,
+    "rs-04": 4 * np.pi,
+    "rs-05": 4 * np.pi,
+    "rs-06": 4 * np.pi,
 }
-"""Position scaling range for MIT frame, in rad"""
+"""Position scaling range for MIT frame, in rad (±4π; RobStride manuals / upstream SDK)."""
 
 
 MODEL_MIT_VELOCITY_TABLE = {

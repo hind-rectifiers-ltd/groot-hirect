@@ -368,12 +368,12 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
                 parallel_bus_reads=True,
             )
             self._arm.connect()
-            # connect() already captures one-turn home offsets (same rule as before).
+            # connect() already captures start-pose offsets (current pose = logical 0).
             encoders = self._arm.read_joints(samples=self._qpos_median_samples)
             self._arm.seed_ramp_from_angles(encoders)
-            # Pre-flight: refuse to record unless the follower is already at home.
-            # Ensures the recorded trajectory starts from a known zero pose so we
-            # do not save ramp-from-arbitrary-pose noise as the first frames.
+            # Pre-flight: refuse to record unless the follower is already at the
+            # start pose (logical ~0 after start-pose offset). Ensures the recorded
+            # trajectory starts from a known zero without snap-from-stale-ramp noise.
             try:
                 self._verify_zero_pose()
             except Exception:

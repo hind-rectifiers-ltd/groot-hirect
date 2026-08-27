@@ -245,9 +245,9 @@ def _import_usb_cameras():
 class PolicyRobstrideDriver:
     """Minimal follower commander: ramped MIT targets via ``ActuatorController`` (no leader teleop).
 
-    Uses the same joint read/command pipeline as record: logical frame =
-    directed MECHANICAL_POSITION minus fixed one-turn home offsets captured at
-    connect. :meth:`verify_zero_pose` requires home near 0 in that frame.
+    Same pipeline as record: at ``connect()`` the current encoder pose becomes
+    software zero (logical 0); MIT writes are ``start_pose + logical``. Put the
+    arm at the same physical home used for recording before starting inference.
     """
 
     def __init__(
@@ -257,8 +257,8 @@ class PolicyRobstrideDriver:
         ramp_max_speed_rad_s: float | None = 2.5,
         ramp_from_feedback: bool = False,
         auto_zero: bool = True,
-        safety_max_delta_rad: float = 1.5,
-        safety_max_initial_delta_rad: float = 1.0,
+        safety_max_delta_rad: float = 0.5,
+        safety_max_initial_delta_rad: float = 0.5,
         safety_clamp: bool = True,
     ):
         if str(_REPO_ROOT) not in sys.path:
@@ -285,7 +285,7 @@ class PolicyRobstrideDriver:
         self._motor_ids: list[int] = list(LEFT_ROBSTRIDE_IDS) + list(RIGHT_ROBSTRIDE_IDS)
         self._last_qpos: np.ndarray | None = None
         self._arm: ActuatorController | None = None
-        _ = auto_zero  # connect() always captures one-turn offsets
+        _ = auto_zero  # connect() always captures start-pose offsets
 
         if not dry_run:
             ramp_speed = (
@@ -383,7 +383,7 @@ class PolicyRobstrideDriver:
             feedback = None
         else:
             feedback = self._last_qpos
-        # Logical in / logical out — ActuatorController adds one-turn offsets on write.
+        # Logical in / logical out — ActuatorController adds start-pose offsets on write.
         self._arm.command_joints(t, ramp=True, feedback12=feedback)
 
     # Back-compat alias
@@ -501,14 +501,14 @@ def main() -> None:
     p.add_argument(
         "--safety-max-delta-rad",
         type=float,
-        default=1.5,
-        help="Per-tick |ramped target - encoder| safety cap (rad). Default: 1.5",
+        default=0.5,
+        help="Per-tick |next command - previous command| safety cap (rad). Default: 0.5",
     )
     p.add_argument(
         "--safety-max-initial-delta-rad",
         type=float,
-        default=1.0,
-        help="Safety cap on the first command after connect (rad). Default: 1.0",
+        default=0.5,
+        help="Safety cap on the first command after connect (rad). Default: 0.5",
     )
     p.add_argument(
         "--safety-abort",
@@ -524,7 +524,7 @@ def main() -> None:
     p.add_argument(
         "--no-software-zero",
         action="store_true",
-        help="Deprecated no-op (one-turn home unwrap is always applied inside ActuatorController).",
+        help="Deprecated no-op (start-pose offsets are always applied inside ActuatorController).",
     )
     p.add_argument(
         "--zero-check-low",

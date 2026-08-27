@@ -116,24 +116,17 @@ MOTOR_DIRECTION: dict[int, float] = {
     15: 1.0, 16: -1.0,
 }
 
-# Per-motor "software zero": the joint angle (rad, logical frame) the motor sits
-# at when it reads its mechanical zero. RobStride absolute encoders have a known
-# glitch where a motor truly at angle θ intermittently reports θ ± 2π (e.g. a
-# joint at 0 reads ~6.28). Every revolute joint here travels < π from its zero
-# (largest range is the elbow at -2.30 rad), so any reading more than π away
-# from the software zero can only be that wrap glitch. ``_normalize_near_zero``
-# folds such readings back into the ±π window around the zero, removing the
-# glitch unambiguously. Set a non-zero value here only if a joint's mechanical
-# zero is offset from its logical zero.
-MOTOR_SOFTWARE_ZERO: dict[int, float] = {mid: 0.0 for mid in range(1, 17)}
+# Boot-time pose is captured as each motor's software zero: logical qpos is
+# ``encoder - start_pose`` (0 at connect). MIT writes use ``logical + start_pose``
+# with no ±π fold (MIT range is ±4π). Do not normalize commands toward 0.
+TWO_PI = 2.0 * math.pi
 
-RAMP_MAX_SPEED_RAD_S = 6.0   # rad/s slew limit (per joint, per second)
+RAMP_MAX_SPEED_RAD_S = 1.5   # rad/s slew limit (per joint, per second)
 RAMP_DT_MAX_S = 0.1          # cap on dt used for ramp step calculation
 
-# Command safety: compare targets to live encoder reads in the motor's native frame.
-# Uses per-step delta limits (not abs(angle) > pi) so wrapped encoders near 2*pi do not false-trip.
-SAFETY_MAX_DELTA_RAD = 1.0           # max |ramped target - encoder| per command tick
-SAFETY_MAX_INITIAL_DELTA_RAD = 1.0   # stricter limit on the first command after connect
+# Command safety: cap each joint's next command to previous ± limit (not encoder).
+SAFETY_MAX_DELTA_RAD = 0.5           # max |next command - previous command| per tick
+SAFETY_MAX_INITIAL_DELTA_RAD = 0.5   # same limit on the first command after connect
 SAFETY_EXCLUDED_MOTOR_IDS: tuple[int, ...] = (15, 16)  # grippers
 
 ARM_DOF = len(LEFT_ROBSTRIDE_IDS)              # joints per arm (7 revolute + gripper = 8)
@@ -171,8 +164,20 @@ def _load_robstride():
     return RobstrideBus, Motor, ParameterType
 
 
-def _open_bus(RobstrideBus, Motor, ParameterType, can_channel: str, motor_ids: list[int]):
-    """Connect one CAN bus, enable all motors, write gains.  Returns (bus, motor_list)."""
+def _open_bus(
+    RobstrideBus,
+    Motor,
+    ParameterType,
+    can_channel: str,
+    motor_ids: list[int],
+    *,
+    enable_torque: bool = True,
+):
+    """Connect one CAN bus; optionally enable motors and write gains.
+
+    Returns (bus, motor_list). With ``enable_torque=False`` only opens the bus
+    (for read-only tools) — no enable / MODE / MIT frames.
+    """
     if not motor_ids:
         return None, []
 
@@ -186,6 +191,8 @@ def _open_bus(RobstrideBus, Motor, ParameterType, can_channel: str, motor_ids: l
     try:
         bus = RobstrideBus(can_channel, motors_cfg, calibration)
         bus.connect(handshake=True)
+        if not enable_torque:
+            return bus, list(zip(motor_names, motor_ids))
         for name in motor_names:
             bus.enable(name)
             time.sleep(0.1)
@@ -196,39 +203,27 @@ def _open_bus(RobstrideBus, Motor, ParameterType, can_channel: str, motor_ids: l
             time.sleep(0.05)
             bus.write(name, ParameterType.TORQUE_LIMIT, MOTOR_TORQUE_LIMIT[mid])
             time.sleep(0.05)
-        for name in motor_names:
-            bus.write(name, ParameterType.MODE, 0)
-            time.sleep(0.05)
-        time.sleep(0.2)
+        # Do NOT enter MIT mode here — connect() captures start pose and sends a
+        # hold frame first, then switches MODE. Entering MODE 0 with no setpoint
+        # often seeks absolute 0 and causes the classic start jerk.
+        time.sleep(0.05)
         return bus, list(zip(motor_names, motor_ids))
     except Exception as exc:
         print(f"[move_actuators] bus init failed on {can_channel}: {exc}")
         return None, []
 
 
-def _shortest_delta_rad(to_angle: float, from_angle: float) -> float:
-    """Signed shortest rotation from ``from_angle`` to ``to_angle`` (rad)."""
-    d = float(to_angle) - float(from_angle)
-    return (d + np.pi) % (2.0 * np.pi) - np.pi
-
-
-def _normalize_near_zero(value: float, zero: float = 0.0) -> float:
-    """Collapse RobStride ~2π encoder-wrap glitches around a software zero.
-
-    Maps ``value`` to the equivalent angle within ±π of ``zero``, so a motor
-    physically at ``zero`` that spuriously reports ``zero ± 2π`` reads back as
-    ``zero``. Safe because every revolute joint here travels less than π from
-    its zero, so the ±π window contains exactly one valid representative.
-    """
-    return float(zero) + _shortest_delta_rad(value, zero)
+def _delta_rad(to_angle: float, from_angle: float) -> float:
+    """Linear signed delta (no ±π wrap — multi-turn / start-offset frame)."""
+    return float(to_angle) - float(from_angle)
 
 
 def _ramp_toward(current: float, desired: float, max_step: float) -> float:
-    """Step toward ``desired`` along the shortest angular path (handles ~2π encoder wraps)."""
-    err = _shortest_delta_rad(desired, current)
+    """Step toward ``desired`` with a linear slew limit (no angular wrap)."""
+    err = _delta_rad(desired, current)
     if abs(err) <= max_step:
-        return current + err
-    return current + (max_step if err > 0.0 else -max_step)
+        return float(desired)
+    return float(current) + (max_step if err > 0.0 else -max_step)
 
 
 def _pad12(q: np.ndarray | list | tuple) -> np.ndarray:
@@ -270,22 +265,24 @@ class ActuatorController:
         safety_clamp: bool = False,
         read_max_retries: int = 4,
         parallel_bus_reads: bool = True,
+        enable_torque: bool = True,
     ):
         """
         Args:
             ramp: Slew-limit each joint toward the target (recommended; prevents jerks).
             ramp_max_speed_rad_s: Maximum joint speed allowed by the ramp (rad/s).
             ramp_dt_max_s: dt is capped at this value when computing ramp step.
-            safety_enabled: Reject commands whose targets jump too far from encoder feedback.
-            safety_max_delta_rad: Per-tick |target - encoder| limit (rad, native encoder frame).
+            safety_enabled: Reject commands whose targets jump too far from last command.
+            safety_max_delta_rad: Per-tick |next command - previous command| limit (rad).
             safety_max_initial_delta_rad: Limit for the first command after :meth:`connect`.
             safety_excluded_motor_ids: Motor IDs skipped by safety delta checks.
             safety_abort_on_breach: If True, disable torque and disconnect on breach.
                 Ignored when ``safety_clamp`` is True.
-            safety_clamp: If True, clamp offending targets to ``encoder ± limit`` (shortest
-                path) and keep running instead of aborting. Takes precedence over abort.
+            safety_clamp: If True, saturate offending targets to ``previous ± limit``
+                and keep running instead of aborting. Takes precedence over abort.
             read_max_retries: Per-motor MECHANICAL_POSITION retries after stale RX frames.
             parallel_bus_reads: Read left and right CAN halves in parallel when both are live.
+            enable_torque: If False, open buses for read-only use (no enable / MODE / hold).
         """
         self._ramp = bool(ramp)
         self._ramp_max_speed = float(ramp_max_speed_rad_s)
@@ -300,6 +297,7 @@ class ActuatorController:
         self._last_safety_warn_t = 0.0
         self._read_max_retries = max(0, int(read_max_retries))
         self._parallel_bus_reads = bool(parallel_bus_reads)
+        self._enable_torque = bool(enable_torque)
         self._read_stats_lock = threading.Lock()
 
         self._left_bus = None
@@ -309,6 +307,8 @@ class ActuatorController:
         self._ramped: dict[str, float] = {}
         self._last_cmd_t: float | None = None
         self._connected = False
+        # Per-motor directed-frame start pose. Logical 0 == this pose at connect.
+        self._turn_offsets: dict[int, float] = {}
 
         # Read stats — useful when MIT writes and register reads compete for the bus.
         self._read_calls = 0       # number of times read_joints() was invoked
@@ -321,17 +321,27 @@ class ActuatorController:
     # ------------------------------------------------------------------
 
     def connect(self) -> None:
-        """Open both CAN buses and enable all motors."""
+        """Open both CAN buses; enable motors unless constructed with enable_torque=False."""
         if self._connected:
             return
         RobstrideBus, Motor, ParameterType = _load_robstride()
         self._ParameterType = ParameterType
 
         self._left_bus, self._left_motors = _open_bus(
-            RobstrideBus, Motor, ParameterType, LEFT_CAN, LEFT_ROBSTRIDE_IDS
+            RobstrideBus,
+            Motor,
+            ParameterType,
+            LEFT_CAN,
+            LEFT_ROBSTRIDE_IDS,
+            enable_torque=self._enable_torque,
         )
         self._right_bus, self._right_motors = _open_bus(
-            RobstrideBus, Motor, ParameterType, RIGHT_CAN, RIGHT_ROBSTRIDE_IDS
+            RobstrideBus,
+            Motor,
+            ParameterType,
+            RIGHT_CAN,
+            RIGHT_ROBSTRIDE_IDS,
+            enable_torque=self._enable_torque,
         )
         if not self._left_bus and not self._right_bus:
             raise RuntimeError(
@@ -341,10 +351,14 @@ class ActuatorController:
         self._last_cmd_t = time.monotonic()
         self._safety_command_count = 0
         self._connected = True
+        self._capture_start_pose_offsets()
+        if self._enable_torque:
+            self._hold_at_start_pose()
         print(
             f"[move_actuators] connected "
             f"(left={LEFT_CAN}:{len(self._left_motors)} motors, "
             f"right={RIGHT_CAN}:{len(self._right_motors)} motors, "
+            f"enable_torque={self._enable_torque}, "
             f"safety_clamp={self._safety_clamp}, "
             f"safety_max_delta={self._safety_max_delta_rad:.3f} rad)",
             flush=True,
@@ -376,6 +390,7 @@ class ActuatorController:
         self._left_motors = []
         self._right_motors = []
         self._ramped.clear()
+        self._turn_offsets.clear()
         self._safety_command_count = 0
         self._connected = False
 
@@ -383,6 +398,91 @@ class ActuatorController:
         if joint_index < ARM_DOF:
             return self._left_bus is not None and len(self._left_motors) > 0
         return self._right_bus is not None and len(self._right_motors) > 0
+
+    def _capture_start_pose_offsets(self) -> None:
+        """
+        Treat each motor's current encoder pose as software zero.
+
+        ``logical = encoder - start`` (linear; no ±π normalize).
+        MIT writes use ``logical + start`` so teleop-zero holds the start pose.
+        """
+        self._turn_offsets = {mid: 0.0 for mid in range(1, 17)}
+        lines: list[str] = []
+
+        def _capture_bus(bus, motors: list[tuple[str, int]]) -> None:
+            if bus is None or not motors:
+                return
+            self._drain_bus_rx(bus)
+            for name, mid in motors:
+                native = self._read_one_with_retry(bus, name)
+                directed = native * MOTOR_DIRECTION.get(mid, 1.0)
+                self._turn_offsets[mid] = float(directed)
+                lines.append(
+                    f"  motor id {mid}: start={directed:+.4f} rad → logical 0"
+                )
+
+        _capture_bus(self._left_bus, self._left_motors)
+        _capture_bus(self._right_bus, self._right_motors)
+        if lines:
+            print(
+                "[move_actuators] Start-pose offsets (current pose = software zero):\n"
+                + "\n".join(lines),
+                flush=True,
+            )
+
+    def _hold_at_start_pose(self) -> None:
+        """Command current start pose, then enter MIT mode (so we never seek abs 0)."""
+        for bus, motors in (
+            (self._left_bus, self._left_motors),
+            (self._right_bus, self._right_motors),
+        ):
+            if bus is None or not motors:
+                continue
+            for name, mid in motors:
+                try:
+                    bus.write_operation_frame(
+                        name,
+                        self._logical_to_mit(0.0, mid),
+                        MOTOR_KP[mid],
+                        MOTOR_KD[mid],
+                        0.0,
+                        0.0,
+                    )
+                except Exception:
+                    pass
+            # Enter operation (MIT) mode only after a hold setpoint is loaded.
+            for name, _mid in motors:
+                try:
+                    bus.write(name, self._ParameterType.MODE, 0)
+                except Exception:
+                    pass
+                time.sleep(0.02)
+            for name, mid in motors:
+                try:
+                    bus.write_operation_frame(
+                        name,
+                        self._logical_to_mit(0.0, mid),
+                        MOTOR_KP[mid],
+                        MOTOR_KD[mid],
+                        0.0,
+                        0.0,
+                    )
+                except Exception:
+                    pass
+            for name, _mid in motors:
+                self._ramped[name] = 0.0
+        self._last_cmd_t = time.monotonic()
+
+    def _logical_to_mit(self, logical: float, mid: int) -> float:
+        """Map logical (0 = start pose) to native MIT position (no ±π fold)."""
+        offset = float(self._turn_offsets.get(mid, 0.0))
+        directed = float(logical) + offset
+        return directed * MOTOR_DIRECTION.get(mid, 1.0)
+
+    def _directed_to_logical(self, directed: float, mid: int) -> float:
+        """Map directed encoder to logical frame (start pose = 0, linear subtract)."""
+        offset = float(self._turn_offsets.get(mid, 0.0))
+        return float(directed) - offset
 
     def _enforce_command_safety(
         self,
@@ -436,7 +536,7 @@ class ActuatorController:
                 continue
             prev = float(previous[i])
             tgt = float(desired[i])
-            signed = _shortest_delta_rad(tgt, prev)
+            signed = _delta_rad(tgt, prev)
             if abs(signed) <= limit:
                 continue
             breaches.append((mid, prev, tgt, abs(signed)))
@@ -517,12 +617,16 @@ class ActuatorController:
             The 16 targets actually written to the motors (after ramp limiting).
 
         Raises:
-            RuntimeError: if not connected.
+            RuntimeError: if not connected or connect was read-only.
             SafetyLimitBreachError: if a ramp-limited target is too far from the encoder reading.
         """
         if not self._connected:
             raise RuntimeError(
                 "[move_actuators] Not connected. Call connect() or use a with-block first."
+            )
+        if not self._enable_torque:
+            raise RuntimeError(
+                "[move_actuators] Connected read-only (enable_torque=False); cannot command."
             )
 
         q = _pad12(angles12)
@@ -568,7 +672,7 @@ class ActuatorController:
             if self._left_bus:
                 try:
                     self._left_bus.write_operation_frame(
-                        name, sent[i] * MOTOR_DIRECTION.get(mid, 1.0),
+                        name, self._logical_to_mit(sent[i], mid),
                         MOTOR_KP[mid], MOTOR_KD[mid], 0.0, 0.0
                     )
                 except Exception:
@@ -578,7 +682,7 @@ class ActuatorController:
             if self._right_bus:
                 try:
                     self._right_bus.write_operation_frame(
-                        name, sent[ARM_DOF + i] * MOTOR_DIRECTION.get(mid, 1.0),
+                        name, self._logical_to_mit(sent[ARM_DOF + i], mid),
                         MOTOR_KP[mid], MOTOR_KD[mid], 0.0, 0.0
                     )
                 except Exception:
@@ -692,8 +796,8 @@ class ActuatorController:
         if drain_rx:
             self._drain_bus_rx(bus)
         for i, (name, mid) in enumerate(motors):
-            raw = self._read_one_with_retry(bus, name) * MOTOR_DIRECTION.get(mid, 1.0)
-            out[i] = _normalize_near_zero(raw, MOTOR_SOFTWARE_ZERO.get(mid, 0.0))
+            directed = self._read_one_with_retry(bus, name) * MOTOR_DIRECTION.get(mid, 1.0)
+            out[i] = self._directed_to_logical(directed, mid)
         return out
 
     def _read_one_with_retry(self, bus, name: str, *, max_retries: int | None = None) -> float:
