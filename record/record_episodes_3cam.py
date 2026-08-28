@@ -3,8 +3,8 @@
 Record per-episode HDF5 demos for a 3-camera humanoid setup.
 
 Session mode (TTY): connect once, keep teleop running across episodes.
-  r     start recording
-  s/Esc stop current episode and save (background; max 1 save at a time)
+  r     start recording (even while a previous episode is saving)
+  s/Esc stop current episode and save (background; waits only if a prior save is still running)
   q     quit session (waits for any in-flight save, then disconnects)
 
 Ctrl+C force-stops the current episode (saves if any frames), then exits the session.
@@ -812,7 +812,9 @@ class EpisodeSaveWorker:
     """
     At most one in-flight HDF5 save.
 
-    ``submit`` waits if a previous save is still running (prints a wait message).
+    ``submit`` blocks only when a save is already running (max 1). Recording the
+    next episode does **not** wait — only finishing an episode and enqueueing its
+    save may wait for the prior save to complete.
     """
 
     def __init__(self) -> None:
@@ -943,8 +945,8 @@ def run_recording_session(
     else:
         print(
             "[session] Teleop stays live across episodes.\n"
-            "  r     start recording\n"
-            "  s/Esc stop + save (background; waits if a prior save is still running)\n"
+            "  r     start recording (can start while previous episode saves in background)\n"
+            "  s/Esc stop + save (waits only if a prior save is still running)\n"
             "  q     quit (waits for save, then disconnects)\n"
             "  Ctrl+C  stop current episode (save if any frames) and quit",
             flush=True,
@@ -957,8 +959,10 @@ def run_recording_session(
                 # Auto-start the only episode.
                 keys.start.set()
             else:
+                save_hint = " (background save in progress)" if saver.busy() else ""
                 print(
-                    f"\n[idle] Teleop live. Press r to record episode_{ep_idx:06d}.hdf5, q to quit.",
+                    f"\n[idle] Teleop live{save_hint}. "
+                    f"Press r to record episode_{ep_idx:06d}.hdf5, q to quit.",
                     flush=True,
                 )
                 keys.clear_transient()
@@ -973,13 +977,12 @@ def run_recording_session(
                 if keys.quit.is_set():
                     break
 
-            try:
-                saver.wait_until_idle(reason="before starting next episode")
-            except RuntimeError as exc:
-                print(f"[session] {exc}", flush=True)
-                break
-
             out = output_dir / f"episode_{ep_idx:06d}.hdf5"
+            if saver.busy():
+                print(
+                    f"\n[record] Starting {out.name} while previous episode still saving...",
+                    flush=True,
+                )
             print(f"\n[record] Recording -> {out.name}  (s/Esc=save, q=save+quit)", flush=True)
             robot.on_episode_start()
             obs_qpos: list[np.ndarray] = []

@@ -181,7 +181,8 @@ Notes:
 - `--teleop-rate 30`, `--dt 0.0333333`, `--camera-fps 30`, and convert `--fps 30` must all match. If the log shows a USB 2.0 fallback to 15 FPS, move a camera to USB 3 before production demos.
 - At ≥ 20 Hz the recorder auto-uses **2 back-to-back median reads** (no gap), zero-dropout filter only, parallel CAN reads, and encoder `feedback` on commands. Safety mode defaults to **clamp** (use `--safety-abort` to disconnect on breach).
 - After countdown, session is **idle** with teleop live: press `r` to start the first episode.
-- `Esc` / `s` ends current episode and saves (background); `r` starts next; `q` quits session.
+- `Esc` / `s` ends current episode and saves in the background; press `r` to start the next episode immediately (even while saving).
+- If you stop an episode while the previous save is still running, the recorder waits briefly before writing the new file (max 1 save at a time).
 - `Ctrl+C` ends current episode (saves if any frames) and quits the session.
 - RobStride/teleop stays connected across episodes — no need to restart the script between takes.
 - Re-running the same command still auto-increments `episode_XXXXXX.hdf5` from existing files.
