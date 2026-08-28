@@ -180,9 +180,11 @@ Notes:
 - `--use-usb-camera-ports` (default on Linux) loads `record/camera_ports.json` — same mapping used at inference.
 - `--teleop-rate 30`, `--dt 0.0333333`, `--camera-fps 30`, and convert `--fps 30` must all match. If the log shows a USB 2.0 fallback to 15 FPS, move a camera to USB 3 before production demos.
 - At ≥ 20 Hz the recorder auto-uses **2 back-to-back median reads** (no gap), zero-dropout filter only, parallel CAN reads, and encoder `feedback` on commands. Safety mode defaults to **clamp** (use `--safety-abort` to disconnect on breach).
-- Recording starts after the countdown and `Start teleoperating now.` message.
-- `Ctrl+C` ends current episode and saves what is captured.
-- Re-running the same command auto-increments `episode_XXXXXX.hdf5`.
+- After countdown, session is **idle** with teleop live: press `r` to start the first episode.
+- `Esc` / `s` ends current episode and saves (background); `r` starts next; `q` quits session.
+- `Ctrl+C` ends current episode (saves if any frames) and quits the session.
+- RobStride/teleop stays connected across episodes — no need to restart the script between takes.
+- Re-running the same command still auto-increments `episode_XXXXXX.hdf5` from existing files.
 - After a test episode, confirm HDF5 `fps` ≈ 30 (cameras must keep up with `--dt`).
 - HDF5 stores `cam_head` / `cam_left_wrist` / `cam_right_wrist` by role name (not `/dev/videoN`), so conversion and training are unaffected by node renumbering as long as recording used the correct port mapping.
 

@@ -2,8 +2,13 @@
 """
 Record per-episode HDF5 demos for a 3-camera humanoid setup.
 
-Press Esc in the recording terminal to stop and save the current episode (Ctrl+C still
-force-stops and saves). If stdin is not a TTY, use --max-steps or Ctrl+C.
+Session mode (TTY): connect once, keep teleop running across episodes.
+  r     start recording
+  s/Esc stop current episode and save (background; max 1 save at a time)
+  q     quit session (waits for any in-flight save, then disconnects)
+
+Ctrl+C force-stops the current episode (saves if any frames), then exits the session.
+If stdin is not a TTY, records a single episode until --max-steps or Ctrl+C.
 
 Expected camera names:
   - cam_head
@@ -25,6 +30,7 @@ import os
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -615,18 +621,37 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
         super().close()
 
 
-def _start_esc_stop_listener() -> tuple[threading.Event, threading.Event, Callable[[], None]]:
-    """
-    Background: set `user_stop` when the user presses Esc in the terminal.
+@dataclass
+class SessionKeyEvents:
+    """Keyboard signals for the multi-episode recording session."""
 
-    Returns (user_stop, shutdown, join_timeout) where caller must set `shutdown` and call
-    `join_timeout()` when recording ends so the thread exits (short join, non-fatal).
+    start: threading.Event = field(default_factory=threading.Event)  # r
+    stop_save: threading.Event = field(default_factory=threading.Event)  # s or Esc
+    quit: threading.Event = field(default_factory=threading.Event)  # q
+    shutdown: threading.Event = field(default_factory=threading.Event)
+    available: bool = False  # False when stdin is not a TTY / listener could not start
+
+    def clear_transient(self) -> None:
+        self.start.clear()
+        self.stop_save.clear()
+
+
+def _start_session_key_listener() -> tuple[SessionKeyEvents, Callable[[], None]]:
     """
-    user_stop = threading.Event()
-    shutdown = threading.Event()
+    Background keyboard listener for the whole recording session.
+
+    Keys (TTY):
+      r / R  → start recording
+      s / S  → stop + save
+      Esc    → stop + save (same as s)
+      q / Q  → quit session
+
+    Returns (events, join_fn). Caller must set events.shutdown and call join_fn on exit.
+    """
+    events = SessionKeyEvents()
 
     def join_timeout() -> None:
-        shutdown.set()
+        events.shutdown.set()
         if thread is not None and thread.is_alive():
             thread.join(timeout=0.5)
 
@@ -636,42 +661,59 @@ def _start_esc_stop_listener() -> tuple[threading.Event, threading.Event, Callab
         try:
             import msvcrt
         except ImportError:
-            return user_stop, shutdown, join_timeout
+            return events, join_timeout
 
         def _win_loop() -> None:
-            while not shutdown.is_set():
+            events.available = True
+            while not events.shutdown.is_set():
                 if msvcrt.kbhit():
                     c = msvcrt.getch()
-                    if c == b"\x1b":
-                        user_stop.set()
-                        return
+                    if c in (b"r", b"R"):
+                        events.start.set()
+                    elif c in (b"s", b"S") or c == b"\x1b":
+                        events.stop_save.set()
+                    elif c in (b"q", b"Q"):
+                        events.quit.set()
                 time.sleep(0.02)
 
         thread = threading.Thread(target=_win_loop, daemon=True)
         thread.start()
-        return user_stop, shutdown, join_timeout
+        return events, join_timeout
 
-    # POSIX: raw-ish stdin to detect lone Escape vs arrow sequences
     import select
     import termios
     import tty
 
-    fd = sys.stdin.fileno()
+    try:
+        fd = sys.stdin.fileno()
+    except (OSError, ValueError):
+        return events, join_timeout
     if not os.isatty(fd):
-        return user_stop, shutdown, join_timeout
+        return events, join_timeout
 
     def _posix_loop() -> None:
         old: list[Any] | None = None
         try:
             old = termios.tcgetattr(fd)
             tty.setcbreak(fd)
-            while not shutdown.is_set():
+            events.available = True
+            while not events.shutdown.is_set():
                 r, _, _ = select.select([sys.stdin], [], [], 0.1)
                 if not r:
                     continue
                 ch = sys.stdin.read(1)
+                if ch in ("r", "R"):
+                    events.start.set()
+                    continue
+                if ch in ("s", "S"):
+                    events.stop_save.set()
+                    continue
+                if ch in ("q", "Q"):
+                    events.quit.set()
+                    continue
                 if ch != "\x1b":
                     continue
+                # Lone Esc vs CSI arrow sequences.
                 r2, _, _ = select.select([sys.stdin], [], [], 0.04)
                 if r2:
                     ch2 = sys.stdin.read(1)
@@ -680,8 +722,7 @@ def _start_esc_stop_listener() -> tuple[threading.Event, threading.Event, Callab
                         if r3:
                             sys.stdin.read(1)
                     continue
-                user_stop.set()
-                return
+                events.stop_save.set()
         except (OSError, termios.error, ValueError):
             pass
         finally:
@@ -693,7 +734,9 @@ def _start_esc_stop_listener() -> tuple[threading.Event, threading.Event, Callab
 
     thread = threading.Thread(target=_posix_loop, daemon=True)
     thread.start()
-    return user_stop, shutdown, join_timeout
+    # Tiny settle so available flag is set before caller prints help.
+    time.sleep(0.05)
+    return events, join_timeout
 
 
 def get_next_episode_index(output_dir: Path) -> int:
@@ -707,6 +750,326 @@ def get_next_episode_index(output_dir: Path) -> int:
     return 0 if not ids else max(ids) + 1
 
 
+@dataclass
+class EpisodePackage:
+    """Finished episode buffers handed off to the save worker (ownership transfers)."""
+
+    output_path: Path
+    task: str
+    dt: float
+    timestamps: list[float]
+    images: dict[str, list[np.ndarray]]
+    qpos: list[np.ndarray]
+    actions: list[np.ndarray]
+    qvel: list[np.ndarray]
+    effort: list[np.ndarray]
+    include_qvel: bool
+    include_effort: bool
+
+
+def write_episode_hdf5(pkg: EpisodePackage) -> None:
+    """Write one episode to HDF5 (gzip images). Uses a temp file then rename."""
+    output_path = pkg.output_path
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    n = len(pkg.timestamps)
+    print(f"[save] Writing {output_path.name} ({n} steps)...", flush=True)
+    t0 = time.monotonic()
+    try:
+        with h5py.File(tmp_path, "w") as root:
+            root.attrs["task"] = pkg.task
+            root.attrs["fps"] = 1.0 / pkg.dt if pkg.dt > 0 else 0.0
+            root.create_dataset("/timestamp", data=np.asarray(pkg.timestamps, dtype=np.float64))
+            obs_grp = root.create_group("observations")
+            img_grp = obs_grp.create_group("images")
+            for cam in CAMERA_NAMES:
+                img_grp.create_dataset(
+                    cam,
+                    data=np.asarray(pkg.images[cam], dtype=np.uint8),
+                    compression="gzip",
+                )
+            obs_grp.create_dataset("qpos", data=np.asarray(pkg.qpos, dtype=np.float32))
+            root.create_dataset("action", data=np.asarray(pkg.actions, dtype=np.float32))
+            if pkg.include_qvel and pkg.qvel:
+                obs_grp.create_dataset("qvel", data=np.asarray(pkg.qvel, dtype=np.float32))
+            if pkg.include_effort and pkg.effort:
+                obs_grp.create_dataset("effort", data=np.asarray(pkg.effort, dtype=np.float32))
+        tmp_path.replace(output_path)
+    except Exception:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+        raise
+    elapsed = time.monotonic() - t0
+    print(f"[save] Saved {output_path.name} in {elapsed:.1f}s.", flush=True)
+
+
+class EpisodeSaveWorker:
+    """
+    At most one in-flight HDF5 save.
+
+    ``submit`` waits if a previous save is still running (prints a wait message).
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._error: BaseException | None = None
+
+    def busy(self) -> bool:
+        t = self._thread
+        return t is not None and t.is_alive()
+
+    def wait_until_idle(self, *, reason: str) -> None:
+        t = self._thread
+        if t is not None and t.is_alive():
+            print(f"[save] Waiting for previous episode save to finish ({reason})...", flush=True)
+            t.join()
+        self._raise_if_failed()
+
+    def _raise_if_failed(self) -> None:
+        if self._error is not None:
+            err = self._error
+            self._error = None
+            raise RuntimeError(f"Background episode save failed: {err}") from err
+
+    def submit(self, pkg: EpisodePackage) -> None:
+        self.wait_until_idle(reason="before starting next save")
+        self._error = None
+
+        def _run() -> None:
+            try:
+                write_episode_hdf5(pkg)
+            except BaseException as exc:  # noqa: BLE001 — surface to main via wait
+                self._error = exc
+                print(f"[save] ERROR writing {pkg.output_path.name}: {exc}", flush=True)
+
+        with self._lock:
+            self._thread = threading.Thread(
+                target=_run,
+                name=f"save-{pkg.output_path.name}",
+                daemon=False,
+            )
+            self._thread.start()
+
+
+def _capture_one_step(
+    robot: RobotInterface,
+    *,
+    imgs: dict[str, list[np.ndarray]],
+    obs_qpos: list[np.ndarray],
+    act: list[np.ndarray],
+    obs_qvel: list[np.ndarray],
+    obs_effort: list[np.ndarray],
+    ts: list[float],
+    t0: float,
+    include_qvel: bool,
+    include_effort: bool,
+) -> None:
+    step_start = time.time()
+    o = robot.get_observation()
+    a = robot.get_action()
+    for cam in CAMERA_NAMES:
+        imgs[cam].append(np.asarray(o["images"][cam], dtype=np.uint8))
+    obs_qpos.append(np.asarray(o["qpos"], dtype=np.float32))
+    act.append(np.asarray(a, dtype=np.float32))
+    if include_qvel and "qvel" in o:
+        obs_qvel.append(np.asarray(o["qvel"], dtype=np.float32))
+    if include_effort and "effort" in o:
+        obs_effort.append(np.asarray(o["effort"], dtype=np.float32))
+    ts.append(float(step_start - t0))
+
+
+def _package_buffers(
+    *,
+    output_path: Path,
+    task: str,
+    dt: float,
+    imgs: dict[str, list[np.ndarray]],
+    obs_qpos: list[np.ndarray],
+    act: list[np.ndarray],
+    obs_qvel: list[np.ndarray],
+    obs_effort: list[np.ndarray],
+    ts: list[float],
+    include_qvel: bool,
+    include_effort: bool,
+) -> EpisodePackage:
+    return EpisodePackage(
+        output_path=output_path,
+        task=task,
+        dt=dt,
+        timestamps=ts,
+        images=imgs,
+        qpos=obs_qpos,
+        actions=act,
+        qvel=obs_qvel,
+        effort=obs_effort,
+        include_qvel=include_qvel,
+        include_effort=include_effort,
+    )
+
+
+def run_recording_session(
+    robot: RobotInterface,
+    output_dir: Path,
+    *,
+    task: str,
+    max_steps: int,
+    dt: float,
+    include_qvel: bool = True,
+    include_effort: bool = True,
+    start_episode_idx: int | None = None,
+) -> None:
+    """
+    Multi-episode session: teleop stays connected; r/s/q (Esc=stop+save).
+
+    Non-TTY: records a single episode until max_steps / Ctrl+C, then exits.
+    """
+    keys, keys_join = _start_session_key_listener()
+    saver = EpisodeSaveWorker()
+    ep_idx = start_episode_idx if start_episode_idx is not None else get_next_episode_index(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    single_shot = not keys.available
+    if single_shot:
+        print(
+            "[session] stdin is not a TTY — recording one episode until --max-steps or Ctrl+C.",
+            flush=True,
+        )
+    else:
+        print(
+            "[session] Teleop stays live across episodes.\n"
+            "  r     start recording\n"
+            "  s/Esc stop + save (background; waits if a prior save is still running)\n"
+            "  q     quit (waits for save, then disconnects)\n"
+            "  Ctrl+C  stop current episode (save if any frames) and quit",
+            flush=True,
+        )
+
+    quit_session = False
+    try:
+        while not quit_session:
+            if single_shot:
+                # Auto-start the only episode.
+                keys.start.set()
+            else:
+                print(
+                    f"\n[idle] Teleop live. Press r to record episode_{ep_idx:06d}.hdf5, q to quit.",
+                    flush=True,
+                )
+                keys.clear_transient()
+                while not keys.quit.is_set():
+                    if keys.start.is_set():
+                        keys.start.clear()
+                        break
+                    # Esc/s in idle are ignored (nothing to stop).
+                    if keys.stop_save.is_set():
+                        keys.stop_save.clear()
+                    time.sleep(0.05)
+                if keys.quit.is_set():
+                    break
+
+            try:
+                saver.wait_until_idle(reason="before starting next episode")
+            except RuntimeError as exc:
+                print(f"[session] {exc}", flush=True)
+                break
+
+            out = output_dir / f"episode_{ep_idx:06d}.hdf5"
+            print(f"\n[record] Recording -> {out.name}  (s/Esc=save, q=save+quit)", flush=True)
+            robot.on_episode_start()
+            obs_qpos: list[np.ndarray] = []
+            act: list[np.ndarray] = []
+            obs_qvel: list[np.ndarray] = []
+            obs_effort: list[np.ndarray] = []
+            imgs: dict[str, list[np.ndarray]] = {cam: [] for cam in CAMERA_NAMES}
+            ts: list[float] = []
+            t0 = time.time()
+            n = 0
+            stop_reason = "max_steps"
+            keys.clear_transient()
+
+            try:
+                for _ in range(max_steps):
+                    if keys.quit.is_set():
+                        stop_reason = "quit"
+                        break
+                    if keys.stop_save.is_set():
+                        keys.stop_save.clear()
+                        stop_reason = "stop"
+                        break
+                    step_start = time.time()
+                    _capture_one_step(
+                        robot,
+                        imgs=imgs,
+                        obs_qpos=obs_qpos,
+                        act=act,
+                        obs_qvel=obs_qvel,
+                        obs_effort=obs_effort,
+                        ts=ts,
+                        t0=t0,
+                        include_qvel=include_qvel,
+                        include_effort=include_effort,
+                    )
+                    n += 1
+                    if n == 1 or n % 30 == 0:
+                        print(f"\r[record] steps={n}", end="", flush=True)
+                    time.sleep(max(0.0, dt - (time.time() - step_start)))
+            except KeyboardInterrupt:
+                stop_reason = "interrupt"
+                print("\n[record] Ctrl+C — stopping episode.", flush=True)
+            finally:
+                robot.on_episode_end()
+                if n > 0:
+                    print(flush=True)
+
+            if n == 0:
+                print("[record] No frames captured; not saving.", flush=True)
+            else:
+                reason_msg = {
+                    "stop": "s/Esc",
+                    "quit": "q",
+                    "interrupt": "Ctrl+C",
+                    "max_steps": "max-steps",
+                }.get(stop_reason, stop_reason)
+                print(f"[record] End ({reason_msg}), {n} steps → queue save {out.name}", flush=True)
+                pkg = _package_buffers(
+                    output_path=out,
+                    task=task,
+                    dt=dt,
+                    imgs=imgs,
+                    obs_qpos=obs_qpos,
+                    act=act,
+                    obs_qvel=obs_qvel,
+                    obs_effort=obs_effort,
+                    ts=ts,
+                    include_qvel=include_qvel,
+                    include_effort=include_effort,
+                )
+                # Drop local refs; save thread owns the arrays.
+                del imgs, obs_qpos, act, obs_qvel, obs_effort, ts
+                saver.submit(pkg)
+                ep_idx += 1
+
+            if stop_reason in ("quit", "interrupt") or single_shot:
+                quit_session = True
+
+    finally:
+        try:
+            saver.wait_until_idle(reason="before exit")
+        except RuntimeError as exc:
+            print(f"[session] {exc}", flush=True)
+        keys.shutdown.set()
+        keys_join()
+        print("[session] Exiting. Disconnecting robot...", flush=True)
+        if hasattr(robot, "close"):
+            robot.close()
+
+
 def record_episode(
     robot: RobotInterface,
     output_path: Path,
@@ -716,61 +1079,70 @@ def record_episode(
     include_qvel: bool = True,
     include_effort: bool = True,
 ) -> tuple[bool, bool]:
-    robot.on_episode_start()
-    obs_qpos, act, obs_qvel, obs_effort = [], [], [], []
-    imgs = {cam: [] for cam in CAMERA_NAMES}
-    ts = []
+    """
+    Record a single episode (legacy helper). Prefer ``run_recording_session`` for demos.
 
-    esc_stop, esc_shutdown, esc_join = _start_esc_stop_listener()
+    Returns (saved_ok, interrupted_by_ctrl_c).
+    """
+    # Thin wrapper: one-shot session into a fixed path via a temp session dir trick
+    # is awkward; keep a direct capture+save path for callers/tests.
+    keys, keys_join = _start_session_key_listener()
+    robot.on_episode_start()
+    obs_qpos: list[np.ndarray] = []
+    act: list[np.ndarray] = []
+    obs_qvel: list[np.ndarray] = []
+    obs_effort: list[np.ndarray] = []
+    imgs: dict[str, list[np.ndarray]] = {cam: [] for cam in CAMERA_NAMES}
+    ts: list[float] = []
     t0 = time.time()
     n = 0
     interrupted = False
     try:
         for _ in range(max_steps):
-            if esc_stop.is_set():
-                print("\nEnd of episode (Esc). Saving frames captured so far...", flush=True)
+            if keys.stop_save.is_set() or keys.quit.is_set():
+                print("\nEnd of episode (Esc/s/q). Saving frames captured so far...", flush=True)
                 break
             step_start = time.time()
-            o = robot.get_observation()
-            a = robot.get_action()
-            for cam in CAMERA_NAMES:
-                imgs[cam].append(np.asarray(o["images"][cam], dtype=np.uint8))
-            obs_qpos.append(np.asarray(o["qpos"], dtype=np.float32))
-            act.append(np.asarray(a, dtype=np.float32))
-            if include_qvel and "qvel" in o:
-                obs_qvel.append(np.asarray(o["qvel"], dtype=np.float32))
-            if include_effort and "effort" in o:
-                obs_effort.append(np.asarray(o["effort"], dtype=np.float32))
-            ts.append(float(step_start - t0))
+            _capture_one_step(
+                robot,
+                imgs=imgs,
+                obs_qpos=obs_qpos,
+                act=act,
+                obs_qvel=obs_qvel,
+                obs_effort=obs_effort,
+                ts=ts,
+                t0=t0,
+                include_qvel=include_qvel,
+                include_effort=include_effort,
+            )
             n += 1
             time.sleep(max(0.0, dt - (time.time() - step_start)))
     except KeyboardInterrupt:
         interrupted = True
         print("\nStopped early (Ctrl+C). Saving frames captured so far...", flush=True)
     finally:
-        esc_shutdown.set()
-        esc_join()
+        keys.shutdown.set()
+        keys_join()
         robot.on_episode_end()
 
     if n == 0:
         return False, interrupted
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with h5py.File(output_path, "w") as root:
-        root.attrs["task"] = task
-        root.attrs["fps"] = 1.0 / dt if dt > 0 else 0.0
-        root.create_dataset("/timestamp", data=np.asarray(ts, dtype=np.float64))
-        obs_grp = root.create_group("observations")
-        img_grp = obs_grp.create_group("images")
-        for cam in CAMERA_NAMES:
-            img_grp.create_dataset(cam, data=np.asarray(imgs[cam], dtype=np.uint8), compression="gzip")
-        qpos_arr = np.asarray(obs_qpos, dtype=np.float32)
-        obs_grp.create_dataset("qpos", data=qpos_arr)
-        root.create_dataset("action", data=np.asarray(act, dtype=np.float32))
-        if include_qvel and obs_qvel:
-            obs_grp.create_dataset("qvel", data=np.asarray(obs_qvel, dtype=np.float32))
-        if include_effort and obs_effort:
-            obs_grp.create_dataset("effort", data=np.asarray(obs_effort, dtype=np.float32))
+    write_episode_hdf5(
+        _package_buffers(
+            output_path=output_path,
+            task=task,
+            dt=dt,
+            imgs=imgs,
+            obs_qpos=obs_qpos,
+            act=act,
+            obs_qvel=obs_qvel,
+            obs_effort=obs_effort,
+            ts=ts,
+            include_qvel=include_qvel,
+            include_effort=include_effort,
+        )
+    )
     return True, interrupted
 
 
@@ -877,38 +1249,30 @@ def main() -> None:
             sys.exit(1)
 
     ep_idx = args.episode_idx if args.episode_idx is not None else get_next_episode_index(args.output_dir)
-    out = args.output_dir / f"episode_{ep_idx:06d}.hdf5"
-    print(f"Recording -> {out}")
-    print("Starting in 2 seconds...")
+    print(f"[session] Output dir: {args.output_dir}  (next episode index: {ep_idx})", flush=True)
+    print("Starting in 2 seconds (teleop already live if direct_teleop)...", flush=True)
     time.sleep(2)
-    print("Start teleoperating now. Press Esc in this terminal to stop and save the episode.", flush=True)
 
     try:
-        ok, stopped_early = record_episode(
+        run_recording_session(
             robot,
-            out,
+            args.output_dir,
             task=args.task,
             max_steps=args.max_steps,
             dt=args.dt,
             include_qvel=not args.no_qvel,
             include_effort=not args.no_effort,
+            start_episode_idx=ep_idx,
         )
-        if ok:
-            if stopped_early:
-                print(f"Saved partial episode ({out.name}); Ctrl+C ended recording early.", flush=True)
-            else:
-                print(f"Saved episode ({out.name}).", flush=True)
-            next_idx = ep_idx + 1
-            next_path = args.output_dir / f"episode_{next_idx:06d}.hdf5"
-            print(
-                f"Next episode: run the same command again; next file will be {next_path.name}.",
-                flush=True,
-            )
-        else:
-            print("No data captured.")
-    finally:
+    except Exception:
+        # Session normally closes the robot in its finally; if connect failed earlier
+        # or session raised before that, still try to release.
         if hasattr(robot, "close"):
-            robot.close()
+            try:
+                robot.close()
+            except Exception:
+                pass
+        raise
 
 
 if __name__ == "__main__":
