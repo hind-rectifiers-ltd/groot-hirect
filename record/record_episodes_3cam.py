@@ -5,6 +5,7 @@ Record per-episode HDF5 demos for a 3-camera humanoid setup.
 Session mode (TTY): connect once, keep teleop running across episodes.
   r     start recording (even while a previous episode is saving)
   s/Esc stop current episode and save (background; waits only if a prior save is still running)
+  d     discard current episode (no save; same episode index for next r)
   q     quit session (waits for any in-flight save, then disconnects)
 
 Ctrl+C force-stops the current episode (saves if any frames), then exits the session.
@@ -627,6 +628,7 @@ class SessionKeyEvents:
 
     start: threading.Event = field(default_factory=threading.Event)  # r
     stop_save: threading.Event = field(default_factory=threading.Event)  # s or Esc
+    discard: threading.Event = field(default_factory=threading.Event)  # d
     quit: threading.Event = field(default_factory=threading.Event)  # q
     shutdown: threading.Event = field(default_factory=threading.Event)
     available: bool = False  # False when stdin is not a TTY / listener could not start
@@ -634,6 +636,7 @@ class SessionKeyEvents:
     def clear_transient(self) -> None:
         self.start.clear()
         self.stop_save.clear()
+        self.discard.clear()
 
 
 def _start_session_key_listener() -> tuple[SessionKeyEvents, Callable[[], None]]:
@@ -644,6 +647,7 @@ def _start_session_key_listener() -> tuple[SessionKeyEvents, Callable[[], None]]
       r / R  → start recording
       s / S  → stop + save
       Esc    → stop + save (same as s)
+      d / D  → discard (no save)
       q / Q  → quit session
 
     Returns (events, join_fn). Caller must set events.shutdown and call join_fn on exit.
@@ -672,6 +676,8 @@ def _start_session_key_listener() -> tuple[SessionKeyEvents, Callable[[], None]]
                         events.start.set()
                     elif c in (b"s", b"S") or c == b"\x1b":
                         events.stop_save.set()
+                    elif c in (b"d", b"D"):
+                        events.discard.set()
                     elif c in (b"q", b"Q"):
                         events.quit.set()
                 time.sleep(0.02)
@@ -707,6 +713,9 @@ def _start_session_key_listener() -> tuple[SessionKeyEvents, Callable[[], None]]
                     continue
                 if ch in ("s", "S"):
                     events.stop_save.set()
+                    continue
+                if ch in ("d", "D"):
+                    events.discard.set()
                     continue
                 if ch in ("q", "Q"):
                     events.quit.set()
@@ -947,6 +956,7 @@ def run_recording_session(
             "[session] Teleop stays live across episodes.\n"
             "  r     start recording (can start while previous episode saves in background)\n"
             "  s/Esc stop + save (waits only if a prior save is still running)\n"
+            "  d     discard current episode (no save; retry same episode index)\n"
             "  q     quit (waits for save, then disconnects)\n"
             "  Ctrl+C  stop current episode (save if any frames) and quit",
             flush=True,
@@ -970,9 +980,11 @@ def run_recording_session(
                     if keys.start.is_set():
                         keys.start.clear()
                         break
-                    # Esc/s in idle are ignored (nothing to stop).
+                    # Esc/s/d in idle are ignored (nothing to stop/discard).
                     if keys.stop_save.is_set():
                         keys.stop_save.clear()
+                    if keys.discard.is_set():
+                        keys.discard.clear()
                     time.sleep(0.05)
                 if keys.quit.is_set():
                     break
@@ -983,7 +995,7 @@ def run_recording_session(
                     f"\n[record] Starting {out.name} while previous episode still saving...",
                     flush=True,
                 )
-            print(f"\n[record] Recording -> {out.name}  (s/Esc=save, q=save+quit)", flush=True)
+            print(f"\n[record] Recording -> {out.name}  (s/Esc=save, d=discard, q=save+quit)", flush=True)
             robot.on_episode_start()
             obs_qpos: list[np.ndarray] = []
             act: list[np.ndarray] = []
@@ -1000,6 +1012,10 @@ def run_recording_session(
                 for _ in range(max_steps):
                     if keys.quit.is_set():
                         stop_reason = "quit"
+                        break
+                    if keys.discard.is_set():
+                        keys.discard.clear()
+                        stop_reason = "discard"
                         break
                     if keys.stop_save.is_set():
                         keys.stop_save.clear()
@@ -1032,6 +1048,9 @@ def run_recording_session(
 
             if n == 0:
                 print("[record] No frames captured; not saving.", flush=True)
+            elif stop_reason == "discard":
+                print(f"[record] Discarded {out.name} ({n} steps, not saved).", flush=True)
+                del imgs, obs_qpos, act, obs_qvel, obs_effort, ts
             else:
                 reason_msg = {
                     "stop": "s/Esc",

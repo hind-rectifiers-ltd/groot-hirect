@@ -182,6 +182,7 @@ Notes:
 - At ≥ 20 Hz the recorder auto-uses **2 back-to-back median reads** (no gap), zero-dropout filter only, parallel CAN reads, and encoder `feedback` on commands. Safety mode defaults to **clamp** (use `--safety-abort` to disconnect on breach).
 - After countdown, session is **idle** with teleop live: press `r` to start the first episode.
 - `Esc` / `s` ends current episode and saves in the background; press `r` to start the next episode immediately (even while saving).
+- `d` discards the current episode (no HDF5 written); next `r` reuses the same `episode_XXXXXX.hdf5` index.
 - If you stop an episode while the previous save is still running, the recorder waits briefly before writing the new file (max 1 save at a time).
 - `Ctrl+C` ends current episode (saves if any frames) and quits the session.
 - RobStride/teleop stays connected across episodes — no need to restart the script between takes.
