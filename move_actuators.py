@@ -113,7 +113,7 @@ MOTOR_DIRECTION: dict[int, float] = {
     1: 1.0, 2: 1.0, 3: 1.0, 4: 1.0, 5: 1.0, 6: 1.0, 7: 1.0,
     8: 1.0,                                        # right elbow_roll (inverted mounting)
     9: 1.0, 10: 1.0, 11: -1.0, 12: -1.0, 13: 1.0, 14: 1.0,
-    15: 1.0, 16: -1.0,
+    15: 1.0, 16: 1.0,
 }
 
 # Boot-time pose is captured as each motor's software zero: logical qpos is
@@ -121,7 +121,7 @@ MOTOR_DIRECTION: dict[int, float] = {
 # with no ±π fold (MIT range is ±4π). Do not normalize commands toward 0.
 TWO_PI = 2.0 * math.pi
 
-RAMP_MAX_SPEED_RAD_S = 1.5   # rad/s slew limit (per joint, per second)
+RAMP_MAX_SPEED_RAD_S = 6.0   # rad/s slew limit (per joint, per second)
 RAMP_DT_MAX_S = 0.1          # cap on dt used for ramp step calculation
 
 # Command safety: cap each joint's next command to previous ± limit (not encoder).
