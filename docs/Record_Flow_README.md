@@ -214,6 +214,7 @@ Inspect one session:
 
 ```bash
 uv run python record/visualize_recorded_episodes.py --data-dir "${RAW_DIR}"
+# Half speed: --speed 0.5  |  2x: --speed 2
 ```
 
 Inspect recursively under `record/`:
@@ -230,6 +231,8 @@ uv run python record/visualize_recorded_episodes.py \
   --episode 0 \
   --save-video /tmp/preview_pickplace.mp4
 ```
+
+Viewer keys: Space pause, `n`/`p` episode, `,`/`.` skip ±5 frames, `r` restart, `q` quit. `--speed` multiplies playback rate (default `1.0`).
 
 Checklist before conversion:
 

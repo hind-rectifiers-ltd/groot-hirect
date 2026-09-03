@@ -13,6 +13,9 @@ for a file-only export without any display.
 Usage:
   uv run python record/visualize_recorded_episodes.py --data-dir ./record/cube_pick_place
 
+  # Half-speed playback; , / . skip ±5 frames:
+  uv run python record/visualize_recorded_episodes.py --data-dir ./record/foo --speed 0.5
+
   # All sessions under ./record (recursive search for episode_*.hdf5):
   uv run python record/visualize_recorded_episodes.py --data-dir ./record --recursive
 
@@ -45,6 +48,9 @@ CAMERA_BANNER_RGB: dict[str, tuple[int, int, int]] = {
     "cam_left_wrist": (30, 100, 180),
     "cam_right_wrist": (200, 90, 30),
 }
+
+# Frame step for , (back) / . (forward) while paused.
+FRAME_SKIP = 5
 
 # Default humanoid 16-DoF naming (7+1 per arm); also recognize legacy 12-DoF labels
 _DEFAULT_JOINT_LABELS_16 = (
@@ -399,17 +405,24 @@ def build_frame_strip(
         return strip
 
 
+def _effective_playback_fps(data_fps: float, playback_fps: float | None, speed: float) -> float:
+    """Absolute FPS for display: (override or episode fps) * speed."""
+    base = float(playback_fps) if playback_fps is not None else float(data_fps)
+    return max(base * float(speed), 1e-3)
+
+
 def run_viewer_matplotlib(
     episodes: list[Path],
     start_episode: int,
     playback_fps: float | None,
+    speed: float = 1.0,
 ) -> None:
     """Interactive viewer when OpenCV has no HighGUI (e.g. opencv-python-headless)."""
     import matplotlib.pyplot as plt
 
     ep_i = max(0, min(start_episode, len(episodes) - 1))
     data = load_episode(episodes[ep_i])
-    fps = playback_fps if playback_fps is not None else data["fps"]
+    fps = _effective_playback_fps(data["fps"], playback_fps, speed)
 
     state: dict = {
         "ep_i": ep_i,
@@ -434,7 +447,7 @@ def run_viewer_matplotlib(
 
     def load_ep(ep_index: int) -> None:
         state["data"] = load_episode(episodes[ep_index])
-        state["fps"] = playback_fps if playback_fps is not None else state["data"]["fps"]
+        state["fps"] = _effective_playback_fps(state["data"]["fps"], playback_fps, speed)
         state["frame_i"] = 0
 
     def redraw() -> None:
@@ -492,20 +505,23 @@ def run_viewer_matplotlib(
             return
         if key == ",":
             state["paused"] = True
-            state["frame_i"] = max(0, state["frame_i"] - 1)
+            state["frame_i"] = max(0, state["frame_i"] - FRAME_SKIP)
             redraw()
             fig.canvas.draw_idle()
             return
         if key == ".":
             state["paused"] = True
-            state["frame_i"] = min(n_frames - 1, state["frame_i"] + 1)
+            state["frame_i"] = min(n_frames - 1, state["frame_i"] + FRAME_SKIP)
             redraw()
             fig.canvas.draw_idle()
             return
 
     fig.canvas.mpl_connect("key_press_event", on_key)
 
-    print("Controls: Space pause | n/p episode | , . step | r restart | q quit")
+    print(
+        f"Controls: Space pause | n/p episode | , . skip ±{FRAME_SKIP} frames | "
+        f"r restart | q quit  (speed={speed:g}x)"
+    )
     print("Tip: `uv pip install opencv-python` for native OpenCV windows instead of this viewer.")
 
     plt.ion()
@@ -529,25 +545,30 @@ def run_viewer_opencv(
     episodes: list[Path],
     start_episode: int,
     playback_fps: float | None,
+    speed: float = 1.0,
 ) -> None:
     import cv2
 
     ep_i = max(0, min(start_episode, len(episodes) - 1))
     data = load_episode(episodes[ep_i])
-    fps = playback_fps if playback_fps is not None else data["fps"]
+    fps = _effective_playback_fps(data["fps"], playback_fps, speed)
     delay_ms = max(1, int(1000 / max(fps, 1e-3)))
     paused = False
     frame_i = 0
 
-    win = "Recorded dataset (LeRobot-style) — Space pause | n/p episode | , . step | q quit"
+    win = (
+        f"Recorded dataset — Space pause | n/p episode | , . ±{FRAME_SKIP} | "
+        f"q quit | speed={speed:g}x"
+    )
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
     print("Controls:")
     print("  Space     — pause / resume")
     print("  n / p     — next / previous episode")
-    print("  , / .     — step one frame back / forward (when paused)")
+    print(f"  , / .     — skip {FRAME_SKIP} frames back / forward (pauses)")
     print("  r         — restart episode")
     print("  q / ESC   — quit")
+    print(f"Playback: {fps:.2f} fps (speed={speed:g}x)")
 
     while True:
         n_frames = data["length"]
@@ -555,6 +576,8 @@ def run_viewer_opencv(
             print("Episode has 0 frames, skipping.")
             ep_i = (ep_i + 1) % len(episodes)
             data = load_episode(episodes[ep_i])
+            fps = _effective_playback_fps(data["fps"], playback_fps, speed)
+            delay_ms = max(1, int(1000 / max(fps, 1e-3)))
             frame_i = 0
             continue
 
@@ -573,24 +596,24 @@ def run_viewer_opencv(
         elif key == ord("n"):
             ep_i = (ep_i + 1) % len(episodes)
             data = load_episode(episodes[ep_i])
-            fps = playback_fps if playback_fps is not None else data["fps"]
+            fps = _effective_playback_fps(data["fps"], playback_fps, speed)
             delay_ms = max(1, int(1000 / max(fps, 1e-3)))
             frame_i = 0
             paused = False
         elif key == ord("p"):
             ep_i = (ep_i - 1) % len(episodes)
             data = load_episode(episodes[ep_i])
-            fps = playback_fps if playback_fps is not None else data["fps"]
+            fps = _effective_playback_fps(data["fps"], playback_fps, speed)
             delay_ms = max(1, int(1000 / max(fps, 1e-3)))
             frame_i = 0
             paused = False
         elif key == ord("r"):
             frame_i = 0
         elif key == ord(","):
-            frame_i = max(0, frame_i - 1)
+            frame_i = max(0, frame_i - FRAME_SKIP)
             paused = True
         elif key == ord("."):
-            frame_i = min(n_frames - 1, frame_i + 1)
+            frame_i = min(n_frames - 1, frame_i + FRAME_SKIP)
             paused = True
 
         if not paused:
@@ -607,6 +630,7 @@ def run_viewer(
     playback_fps: float | None,
     save_video: Path | None,
     gui: str = "auto",
+    speed: float = 1.0,
 ) -> None:
     if not episodes:
         print("No episode_*.hdf5 files found.", file=sys.stderr)
@@ -620,7 +644,7 @@ def run_viewer(
 
     ep_i = max(0, min(start_episode, len(episodes) - 1))
     data = load_episode(episodes[ep_i])
-    fps = playback_fps if playback_fps is not None else data["fps"]
+    fps = _effective_playback_fps(data["fps"], playback_fps, speed)
     if save_video is not None:
         q0 = data["qpos"][0] if len(data["qpos"]) else None
         strip0 = build_frame_strip(
@@ -650,7 +674,7 @@ def run_viewer(
 
     if gui == "matplotlib":
         try:
-            run_viewer_matplotlib(episodes, start_episode, playback_fps)
+            run_viewer_matplotlib(episodes, start_episode, playback_fps, speed=speed)
         except ImportError:
             print(
                 "Matplotlib is required for --gui matplotlib. Example: uv pip install matplotlib",
@@ -667,12 +691,12 @@ def run_viewer(
                 file=sys.stderr,
             )
             sys.exit(1)
-        run_viewer_opencv(episodes, start_episode, playback_fps)
+        run_viewer_opencv(episodes, start_episode, playback_fps, speed=speed)
         return
 
     # auto
     if opencv_gui_available():
-        run_viewer_opencv(episodes, start_episode, playback_fps)
+        run_viewer_opencv(episodes, start_episode, playback_fps, speed=speed)
     else:
         print(
             "OpenCV HighGUI not available (typical for opencv-python-headless). "
@@ -680,7 +704,7 @@ def run_viewer(
             flush=True,
         )
         try:
-            run_viewer_matplotlib(episodes, start_episode, playback_fps)
+            run_viewer_matplotlib(episodes, start_episode, playback_fps, speed=speed)
         except ImportError:
             print(
                 "Install matplotlib for the fallback viewer: uv pip install matplotlib\n"
@@ -711,7 +735,13 @@ def main() -> None:
         "--fps",
         type=float,
         default=None,
-        help="Playback FPS (default: from file timestamps or attrs).",
+        help="Base playback FPS before --speed (default: from file timestamps or attrs).",
+    )
+    parser.add_argument(
+        "--speed",
+        type=float,
+        default=1.0,
+        help="Playback speed multiplier (e.g. 0.5 = half, 2.0 = double). Default: 1.0.",
     )
     parser.add_argument(
         "--save-video",
@@ -730,13 +760,24 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.speed <= 0:
+        print(f"--speed must be > 0 (got {args.speed})", file=sys.stderr)
+        sys.exit(1)
+
     data_dir = args.data_dir.resolve()
     if not data_dir.is_dir():
         print(f"Not a directory: {data_dir}", file=sys.stderr)
         sys.exit(1)
 
     episodes = discover_episodes(data_dir, args.recursive)
-    run_viewer(episodes, args.episode, args.fps, args.save_video, gui=args.gui)
+    run_viewer(
+        episodes,
+        args.episode,
+        args.fps,
+        args.save_video,
+        gui=args.gui,
+        speed=args.speed,
+    )
 
 
 if __name__ == "__main__":
