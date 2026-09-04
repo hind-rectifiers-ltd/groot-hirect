@@ -400,30 +400,57 @@ uv run python record/policy_client_3cam.py \
   --task "pick up the object and place it in the tray" \
   --robot robstride \
   --use-usb-camera-ports \
+  --camera-fps 30 \
+  --image-height 640 \
+  --image-width 640 \
   --apply-actions \
   --control-mode chunk \
   --rate-hz 30 \
   --policy-ramp-max-speed 2.5 \
   --action-smoothing-alpha 0.5 \
+  --gripper-smoothing-alpha 0.7 \
   --chunk-blend-steps 12
 ```
 
 `--use-usb-camera-ports` is on by default on Linux; it reads `record/camera_ports.json` so inference sees the same head / left / right views as training.
 
+**Must match recording/training:** `--rate-hz 30`, `--camera-fps 30`, 640×640 images, same camera ports, and the **exact** `--task` string from `meta/tasks.jsonl`.
+
+Safer first live pass (same rate match, slower arms):
+
+```bash
+uv run python record/policy_client_3cam.py \
+  --host localhost \
+  --port 5555 \
+  --task "pick up the object and place it in the tray" \
+  --robot robstride \
+  --use-usb-camera-ports \
+  --camera-fps 30 \
+  --apply-actions \
+  --control-mode chunk \
+  --rate-hz 30 \
+  --policy-ramp-max-speed 1.5 \
+  --action-smoothing-alpha 0.7 \
+  --chunk-blend-steps 8 \
+  --max-target-step-arm 0.05
+```
+
 Useful flags:
 
 - `--control-mode chunk` (default): run the 16-step horizon before re-inferring.
 - `--rate-hz 30`: match record (`--teleop-rate 30`, `--dt 0.0333333`) and convert (`--fps 30`).
-- `--policy-ramp-max-speed`: MIT slew cap (try 2.0–2.5 for smoother arms).
+- `--policy-ramp-max-speed`: MIT slew cap (try 1.5–2.5 for smoother arms).
 - `--chunk-blend-steps 12`: soften replan boundaries.
 - `--preview-cameras` on `record_episodes_3cam.py` or `preview_three_cameras.py` if views look swapped mid-session.
 - `--no-use-usb-camera-ports --video-cam-head …` only for legacy numeric overrides.
+- Before `--apply-actions`, run once with `--dry-run-robstride` and check logs: `qpos` vs `target[0]` should be close at home.
 
 Real-robot validation checklist:
 
 - `preview_three_cameras.py` labels match physical cameras.
 - Task string matches `meta/tasks.jsonl` / training text exactly.
 - Follower at home pose (~0 rad); `qpos` stable in logs (no periodic garbage reads).
+- At step 0, `|target[0] - qpos|` should be small; large gaps mean policy/data/camera mismatch, not rate settings.
 - Start with low `--policy-ramp-max-speed` and clear workspace before full task rollout.
 
 ---

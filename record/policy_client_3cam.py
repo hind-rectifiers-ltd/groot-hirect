@@ -650,7 +650,13 @@ def main() -> None:
     step = 0
     chunk_queue: list[np.ndarray] = []
     chunk_plan_id = 0
+    # Seed from current pose so the first chunk blends from home, not from zeros.
     last_cmd = np.zeros(NUM_JOINTS, dtype=np.float32)
+    if driver is not None and args.robot == "robstride" and not args.dry_run_robstride:
+        try:
+            last_cmd = driver.read_qpos16().astype(np.float32)
+        except Exception:
+            pass
 
     def fetch_observation() -> tuple[dict[str, Any], np.ndarray, dict[str, np.ndarray]]:
         raw = robot.get_observation()
