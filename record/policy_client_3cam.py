@@ -220,11 +220,14 @@ def _import_record_interfaces():
     """Lazy import to reuse RobotInterface classes from the recorder."""
     rec = _REPO_ROOT / "record" / "record_episodes_3cam.py"
     import importlib.util
+    import sys
 
     spec = importlib.util.spec_from_file_location("record_episodes_3cam", rec)
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load {rec}")
     mod = importlib.util.module_from_spec(spec)
+    # Required before exec_module: dataclasses look up cls.__module__ in sys.modules.
+    sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod
 
@@ -232,12 +235,15 @@ def _import_record_interfaces():
 def _import_usb_cameras():
     """Lazy import shared USB camera port pinning (record/usb_cameras.py)."""
     import importlib.util
+    import sys
 
     path = _REPO_ROOT / "record" / "usb_cameras.py"
     spec = importlib.util.spec_from_file_location("usb_cameras", path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load {path}")
     mod = importlib.util.module_from_spec(spec)
+    # Required before exec_module: dataclasses look up cls.__module__ in sys.modules.
+    sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod
 
