@@ -393,6 +393,32 @@ uv run python record/preview_three_cameras.py
 
 With the server from [section 7](#7-run-inference-server-with-fine-tuned-checkpoint) already running:
 
+**Cameras + live arm reads, no motor writes** (preferred NaN / policy check):
+
+```bash
+uv run python record/policy_client_3cam.py \
+  --host localhost \
+  --port 5555 \
+  --task "pick up the object and place it in the tray" \
+  --robot robstride \
+  --use-usb-camera-ports \
+  --camera-fps 30 \
+  --image-height 640 \
+  --image-width 640 \
+  --dry-run-robstride \
+  --control-mode chunk \
+  --rate-hz 30 \
+  --max-steps 10
+```
+
+(Same mode if you omit `--apply-actions`: CAN opens read-only, encoders + cameras feed the policy, nothing is commanded.)
+
+Look at `target[0]`: must be finite numbers near home (~0), **not** `+nan`. Cameras may fall back to 15 FPS on USB 2; the 30 Hz loop reuses the latest frame (same as recording). Fix USB 3 when you can.
+
+**Cameras only** (no CAN at all): `--robot usb_cam` instead of `--robot robstride --dry-run-robstride`.
+
+**Live hardware** (only after targets are finite):
+
 ```bash
 uv run python record/policy_client_3cam.py \
   --host localhost \

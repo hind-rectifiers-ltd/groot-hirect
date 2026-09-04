@@ -22,11 +22,16 @@ With USB cameras (stable USB ports via record/camera_ports.json on Linux):
     --robot usb_cam \\
     --list-cameras-working   # optional: verify ports
 
-RobStride follower command (same CAN layout as direct_teleop / record direct_teleop mode):
+RobStride follower (same CAN layout as direct_teleop / record):
+  # Read cameras + live qpos, never write motors (NaN / policy check):
   uv run python record/policy_client_3cam.py \\
-    --robot robstride \\
-    --use-usb-camera-ports \\
-    --task "..." --apply-actions --dry-run-robstride  # omit dry-run on real hardware
+    --robot robstride --use-usb-camera-ports --dry-run-robstride \\
+    --task "..." --rate-hz 30 --max-steps 10
+
+  # Live writes (only after targets are finite):
+  uv run python record/policy_client_3cam.py \\
+    --robot robstride --use-usb-camera-ports --apply-actions \\
+    --task "..."
 
 Control notes:
   - Default ``--control-mode chunk`` runs the full 16-step action horizon before re-inferring (much
@@ -181,6 +186,8 @@ class ActionTargetSmoother:
 
     def apply(self, target: np.ndarray) -> np.ndarray:
         t = pad_vector(target, self._state_dim)
+        if not np.all(np.isfinite(t)):
+            raise ValueError("smoother target contains non-finite values")
         if self._state is None:
             self.reset(t)
             return t.astype(np.float32)
@@ -249,17 +256,21 @@ def _import_usb_cameras():
 
 
 class PolicyRobstrideDriver:
-    """Minimal follower commander: ramped MIT targets via ``ActuatorController`` (no leader teleop).
+    """Follower I/O via ``ActuatorController`` (no leader teleop).
 
     Same pipeline as record: at ``connect()`` the current encoder pose becomes
     software zero (logical 0); MIT writes are ``start_pose + logical``. Put the
     arm at the same physical home used for recording before starting inference.
+
+    ``read_only=True`` opens CAN for encoder reads only (no torque enable / MIT
+    commands) — use to validate policy outputs with live cameras + qpos.
     """
 
     def __init__(
         self,
         dry_run: bool = False,
         *,
+        read_only: bool = False,
         ramp_max_speed_rad_s: float | None = 2.5,
         ramp_from_feedback: bool = False,
         auto_zero: bool = True,
@@ -285,7 +296,9 @@ class PolicyRobstrideDriver:
             )
 
         self._dt = dt
-        self._dry_run = dry_run
+        # dry_run kept as alias: never write; still connect read-only when possible.
+        self._read_only = bool(read_only or dry_run)
+        self._dry_run = self._read_only  # command_a16 / older call sites
         self._ramp_from_feedback = ramp_from_feedback
         self._ramp_max_speed_rad_s = ramp_max_speed_rad_s
         self._motor_ids: list[int] = list(LEFT_ROBSTRIDE_IDS) + list(RIGHT_ROBSTRIDE_IDS)
@@ -293,32 +306,61 @@ class PolicyRobstrideDriver:
         self._arm: ActuatorController | None = None
         _ = auto_zero  # connect() always captures start-pose offsets
 
-        if not dry_run:
-            ramp_speed = (
-                float(ramp_max_speed_rad_s)
-                if ramp_max_speed_rad_s is not None
-                else float(dt.ROBSTRIDE_RAMP_MAX_SPEED_RAD_S)
-            )
-            self._arm = ActuatorController(
-                ramp=True,
-                ramp_max_speed_rad_s=ramp_speed,
-                ramp_dt_max_s=float(dt.ROBSTRIDE_RAMP_DT_MAX_S),
-                safety_max_delta_rad=float(safety_max_delta_rad),
-                safety_max_initial_delta_rad=float(safety_max_initial_delta_rad),
-                safety_clamp=bool(safety_clamp),
-                safety_abort_on_breach=not bool(safety_clamp),
-                read_max_retries=4,
-                parallel_bus_reads=True,
-            )
+        ramp_speed = (
+            float(ramp_max_speed_rad_s)
+            if ramp_max_speed_rad_s is not None
+            else float(dt.ROBSTRIDE_RAMP_MAX_SPEED_RAD_S)
+        )
+        self._arm = ActuatorController(
+            ramp=True,
+            ramp_max_speed_rad_s=ramp_speed,
+            ramp_dt_max_s=float(dt.ROBSTRIDE_RAMP_DT_MAX_S),
+            safety_max_delta_rad=float(safety_max_delta_rad),
+            safety_max_initial_delta_rad=float(safety_max_initial_delta_rad),
+            safety_clamp=bool(safety_clamp),
+            safety_abort_on_breach=not bool(safety_clamp),
+            read_max_retries=4,
+            parallel_bus_reads=True,
+            enable_torque=not self._read_only,
+        )
+        try:
+            self._arm.connect()
+        except Exception:
             try:
-                self._arm.connect()
+                self._arm.disconnect(send_zero=False)
             except Exception:
+                pass
+            self._arm = None
+            raise
+        n_left = len(self._arm._left_motors)
+        n_right = len(self._arm._right_motors)
+        if n_left == 0 or n_right == 0:
+            missing = []
+            if n_left == 0:
+                missing.append("left (zcan1)")
+            if n_right == 0:
+                missing.append("right (zcan0)")
+            msg = (
+                "RobStride bus incomplete — "
+                + " and ".join(missing)
+                + f" has 0 motors (left={n_left}, right={n_right})."
+            )
+            if self._read_only:
+                print(f"[policy_client] WARNING: {msg} Continuing read-only with available arms.", flush=True)
+            else:
                 try:
                     self._arm.disconnect(send_zero=False)
                 except Exception:
                     pass
                 self._arm = None
-                raise
+                raise RuntimeError(
+                    msg + " Fix CAN wiring/power before --apply-actions; refusing half-arm writes."
+                )
+        if self._read_only:
+            print(
+                "[policy_client] RobStride READ-ONLY: live qpos reads on, no torque / no MIT writes.",
+                flush=True,
+            )
 
     def _read_qpos_median(self, *, samples: int = 2) -> np.ndarray:
         assert self._arm is not None
@@ -342,21 +384,23 @@ class PolicyRobstrideDriver:
         high: float = 0.2,
         settle_reads: int = 3,
     ) -> None:
-        """Refuse to proceed unless every follower joint is at home (~0 rad).
+        """Refuse to proceed unless every live follower joint is at home (~0 rad).
 
-        Mirrors the check in ``record/record_episodes_3cam.py`` but with the
-        wider ``[-0.2, +0.2] rad`` tolerance the user requested for inference.
+        Mirrors the check in ``record/record_episodes_3cam.py``.
         Raises:
-            RuntimeError: with a per-motor breakdown if any joint is outside the
+            RuntimeError: with a per-motor breakdown if any live joint is outside the
             allowed window.
         """
-        if self._arm is None or self._dry_run:
+        if self._arm is None:
             return
         qpos = np.zeros(NUM_JOINTS, dtype=np.float32)
         for _ in range(max(1, settle_reads)):
             qpos = self.read_qpos16()
         bad: list[tuple[int, float]] = []
         for i in range(NUM_JOINTS):
+            # Skip joints whose bus never came up (read stays 0 from missing motors).
+            if not self._arm._joint_bus_live(i):
+                continue
             v = float(qpos[i])
             if not (low <= v <= high):
                 bad.append((self._motor_ids[i], v))
@@ -375,15 +419,17 @@ class PolicyRobstrideDriver:
 
     def sync_ramped_from_feedback(self) -> None:
         """Seed the ramp state from current encoders so the first command does not snap."""
-        if self._arm is None:
+        if self._arm is None or self._read_only:
             return
         q = self._read_qpos_median(samples=3)
         self._arm.seed_ramp_from_angles(q)
 
     def command_a16(self, target: np.ndarray) -> None:
-        if self._arm is None or self._dry_run:
+        if self._arm is None or self._read_only:
             return
         t = pad_vector(target, NUM_JOINTS)
+        if not np.all(np.isfinite(t)):
+            raise ValueError("refusing to command non-finite joint targets")
         if self._ramp_from_feedback:
             self._arm.seed_ramp_from_angles(self._read_qpos_median())
             feedback = None
@@ -403,7 +449,8 @@ class PolicyRobstrideDriver:
         except Exception:
             pass
         try:
-            self._arm.disconnect(send_zero=True)
+            # Read-only never enabled torque — skip zero-torque MIT burst on exit.
+            self._arm.disconnect(send_zero=not self._read_only)
         except Exception:
             pass
         self._arm = None
@@ -496,7 +543,12 @@ def main() -> None:
     p.add_argument("--image-height", type=int, default=640)
     p.add_argument("--image-width", type=int, default=640)
     p.add_argument("--apply-actions", action="store_true", help="Send decoded targets to RobStride (robstride only)")
-    p.add_argument("--dry-run-robstride", action="store_true", help="Init driver but do not write CAN")
+    p.add_argument(
+        "--dry-run-robstride",
+        action="store_true",
+        help="Connect RobStride read-only: live encoder qpos + cameras, no torque enable / no MIT writes. "
+        "Also implied when --robot robstride without --apply-actions.",
+    )
     p.add_argument(
         "--policy-ramp-max-speed",
         type=float,
@@ -575,9 +627,18 @@ def main() -> None:
             camera_fps=float(args.camera_fps),
         )
         ramp_cap = None if args.policy_ramp_max_speed == 0 else args.policy_ramp_max_speed
+        # Read-only unless the user explicitly asks to command motors.
+        read_only = (not args.apply_actions) or args.dry_run_robstride
+        if args.apply_actions and args.dry_run_robstride:
+            print(
+                "[policy_client] NOTE: --dry-run-robstride overrides --apply-actions "
+                "(cameras + live qpos, no motor writes).",
+                flush=True,
+            )
         try:
             driver = PolicyRobstrideDriver(
-                dry_run=args.dry_run_robstride,
+                dry_run=read_only,
+                read_only=read_only,
                 ramp_max_speed_rad_s=ramp_cap,
                 ramp_from_feedback=args.ramp_from_feedback,
                 auto_zero=not args.no_software_zero,
@@ -607,8 +668,8 @@ def main() -> None:
     print(f"Connected to GR00T server tcp://{args.host}:{args.port}")
 
     # Pre-inference safety: refuse to run unless the follower is at home pose.
-    # Always run when motors are physically connected; --apply-actions only gates writes.
-    if driver is not None and args.robot == "robstride" and not args.dry_run_robstride:
+    # Run whenever arms are connected (read-only or live); skip only if no driver.
+    if driver is not None and args.robot == "robstride":
         try:
             driver.verify_zero_pose(low=args.zero_check_low, high=args.zero_check_high)
         except RuntimeError as exc:
@@ -632,7 +693,14 @@ def main() -> None:
             max_gripper_step=args.max_target_step_gripper,
         )
 
-    if driver is not None and args.robot == "robstride" and args.apply_actions and not args.dry_run_robstride:
+    write_motors = (
+        driver is not None
+        and args.robot == "robstride"
+        and args.apply_actions
+        and not args.dry_run_robstride
+        and not getattr(driver, "_read_only", False)
+    )
+    if driver is not None and args.robot == "robstride" and write_motors:
         driver.sync_ramped_from_feedback()
         q0 = driver.read_qpos16()
         if smoother is not None:
@@ -651,6 +719,15 @@ def main() -> None:
                 f"max_grip_step={args.max_target_step_gripper}",
                 flush=True,
             )
+    elif driver is not None and args.robot == "robstride":
+        q0 = driver.read_qpos16()
+        if smoother is not None:
+            smoother.reset(q0)
+        print(
+            f"[policy_client] Policy check mode: cameras + live qpos, writes OFF "
+            f"(control_mode={args.control_mode}  rate_hz={args.rate_hz})",
+            flush=True,
+        )
 
     period = 1.0 / max(args.rate_hz, 1e-3)
     step = 0
@@ -658,7 +735,7 @@ def main() -> None:
     chunk_plan_id = 0
     # Seed from current pose so the first chunk blends from home, not from zeros.
     last_cmd = np.zeros(NUM_JOINTS, dtype=np.float32)
-    if driver is not None and args.robot == "robstride" and not args.dry_run_robstride:
+    if driver is not None and args.robot == "robstride":
         try:
             last_cmd = driver.read_qpos16().astype(np.float32)
         except Exception:
@@ -676,6 +753,12 @@ def main() -> None:
         nonlocal chunk_plan_id, last_cmd
         action, _info = client.get_action(obs)
         chunk = actions_to_chunk(action)
+        if not np.all(np.isfinite(chunk)):
+            n_bad = int(np.size(chunk) - np.count_nonzero(np.isfinite(chunk)))
+            raise ValueError(
+                f"policy action chunk contains non-finite values "
+                f"({n_bad}/{np.size(chunk)} bad). Check server/model and camera frames."
+            )
         if args.chunk_upsample > 1:
             chunk = upsample_chunk_linear(chunk, args.chunk_upsample)
         stride = args.infer_stride if args.infer_stride > 0 else chunk.shape[0]
@@ -683,6 +766,8 @@ def main() -> None:
         chunk = chunk[:stride]
         if args.chunk_blend_steps > 0:
             chunk = blend_chunk_start(chunk, last_cmd, args.chunk_blend_steps)
+        if not np.all(np.isfinite(chunk)):
+            raise ValueError("chunk became non-finite after upsample/blend")
         chunk_plan_id += 1
         prec = max(0, args.log_joint_precision)
         print(
@@ -696,7 +781,12 @@ def main() -> None:
 
     def execute_target(raw_target: np.ndarray) -> np.ndarray:
         nonlocal last_cmd
-        cmd = smoother.apply(raw_target) if smoother is not None else pad_vector(raw_target, NUM_JOINTS).astype(np.float32)
+        raw = pad_vector(raw_target, NUM_JOINTS).astype(np.float32)
+        if not np.all(np.isfinite(raw)):
+            raise ValueError("refusing to execute non-finite policy target")
+        cmd = smoother.apply(raw) if smoother is not None else raw
+        if not np.all(np.isfinite(cmd)):
+            raise ValueError("smoothed command is non-finite")
         last_cmd = cmd.copy()
         if args.robot == "robstride" and driver is not None and args.apply_actions:
             driver.command_a16(cmd)
@@ -705,7 +795,19 @@ def main() -> None:
     def hold_last_command(reason: str, qpos: np.ndarray) -> None:
         """Send the previous valid command when policy output is unavailable/invalid."""
         nonlocal step
-        cmd = execute_target(last_cmd)
+        if not np.all(np.isfinite(last_cmd)):
+            print(
+                f"[policy_client] WARN: {reason}; no finite last command to hold — skipping write.",
+                flush=True,
+            )
+            step += 1
+            return
+        cmd = last_cmd.copy()
+        if args.robot == "robstride" and driver is not None and args.apply_actions:
+            try:
+                driver.command_a16(cmd)
+            except Exception as exc:
+                print(f"[policy_client] WARN: hold write failed ({exc})", flush=True)
         print(f"[policy_client] WARN: {reason}; holding last command.", flush=True)
         log_step_state(
             step=step,
@@ -767,9 +869,13 @@ def main() -> None:
                     if driver is not None
                     else np.zeros(NUM_JOINTS, dtype=np.float32)
                 )
-                cmd = execute_target(raw_target)
-                maybe_log_step(qpos=qpos, cmd=cmd, extra=f"queue={len(chunk_queue)}")
-                step += 1
+                try:
+                    cmd = execute_target(raw_target)
+                    maybe_log_step(qpos=qpos, cmd=cmd, extra=f"queue={len(chunk_queue)}")
+                    step += 1
+                except Exception as exc:
+                    chunk_queue = []  # drop poisoned chunk; replan next tick
+                    hold_last_command(f"execute failed ({exc})", qpos)
 
             elapsed = time.monotonic() - t0
             time.sleep(max(0.0, period - elapsed))
