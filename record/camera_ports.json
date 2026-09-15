@@ -1,5 +1,5 @@
 {
-  "cam_head": {"id_path_tag": "platform-3610000_usb-usb-0_4_3"},
-  "cam_left_wrist": {"id_path_tag": "platform-3610000_usb-usb-0_4_1"},
-  "cam_right_wrist": {"id_path_tag": "platform-3610000_usb-usb-0_4_2"}
+  "cam_head": {"id_path_tag": "pci-0000_00_14_0-usb-0_6_3"},
+  "cam_left_wrist": {"id_path_tag": "pci-0000_00_14_0-usb-0_6_1"},
+  "cam_right_wrist": {"id_path_tag": "pci-0000_00_14_0-usb-0_6_2"}
 }

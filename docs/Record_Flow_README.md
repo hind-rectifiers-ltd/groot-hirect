@@ -483,24 +483,35 @@ Real-robot validation checklist:
 
 ## 9) Optional edge deployment path (ONNX/TensorRT)
 
-Export ONNX:
+Full directions (export ONNX → TensorRT → on-robot inference for `NEW_EMBODIMENT`): see **[`docs/DEPLOYMENT.md`](DEPLOYMENT.md)**.
+
+Quick pointers:
 
 ```bash
+# ONNX only
 uv run python scripts/deployment/export_onnx_n1d7.py \
-  --model-path "${CKPT}"
+  --model-path "${CKPT}" \
+  --dataset-path "${DS}" \
+  --embodiment-tag NEW_EMBODIMENT \
+  --output-dir ./gr00t_trt_deployment_3cam/onnx \
+  --export-mode full_pipeline
+
+# ONNX + TensorRT engines (unified pipeline)
+uv run python scripts/deployment/build_trt_pipeline.py \
+  --model-path "${CKPT}" \
+  --dataset-path "${DS}" \
+  --embodiment-tag NEW_EMBODIMENT \
+  --output-dir ./gr00t_trt_deployment_3cam \
+  --export-mode full_pipeline
+
+# Benchmark
+uv run python scripts/deployment/benchmark_inference.py \
+  --model-path "${CKPT}" \
+  --trt-engine-path ./gr00t_trt_deployment_3cam/engines \
+  --trt-mode n17_full_pipeline
 ```
 
-Build TensorRT pipeline:
-
-```bash
-uv run python scripts/deployment/build_trt_pipeline.py
-```
-
-Benchmark:
-
-```bash
-uv run python scripts/deployment/benchmark_inference.py
-```
+On Jetson Orin use `--export-mode dit_only`. Closed-loop robot control still uses `run_gr00t_server.py` + `policy_client_3cam.py` (Path A in `DEPLOYMENT.md`).
 
 ---
 
@@ -514,4 +525,5 @@ uv run python scripts/deployment/benchmark_inference.py
 6. Fine-tune to `"${FT_OUT}"`; pick a checkpoint in `"${CKPT}"`.
 7. Open-loop eval: `open_loop_eval.py` with `--model-path "${CKPT}"`.
 8. Preview cameras again, start server (`run_gr00t_server.py`), then closed-loop `policy_client_3cam.py` with `--use-usb-camera-ports` and `--rate-hz 30`.
+9. Optional edge deploy (ONNX/TRT): follow [`docs/DEPLOYMENT.md`](DEPLOYMENT.md).
 
