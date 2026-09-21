@@ -22,6 +22,7 @@ Safety / control path matches ``record/record_episodes_3cam.py`` and
 from __future__ import annotations
 
 import argparse
+import threading
 import time
 from pathlib import Path
 
@@ -29,6 +30,7 @@ import numpy as np
 
 from direct_teleop import (
     ARM_DOF,
+    FOLLOWER_COMMAND_OFFSET_RAD,
     GRIPPER_MOTION_SCALE,
     INVERT_DELTA_MOTOR_IDS,
     NUM_JOINTS,
@@ -39,6 +41,7 @@ from direct_teleop import (
     ActuatorController,
     accum_units_to_target_delta_rad,
     ensure_import_paths,
+    follower_command_offset_rad,
     get_joint_angles_from_motors,
     print_follower_qpos_action_block,
     ramped_cmd_to_action16,
@@ -57,11 +60,13 @@ RIGHT_HAND_EXTRA_INVERT_MOTOR_IDS: frozenset[int] = frozenset({4, 14})
 
 
 def right_hand_delta_rad(accum_units: float, motor_id: int) -> float:
-    """Leader→follower delta with record invert, then right-hand-only sign flips."""
-    delta = accum_units_to_target_delta_rad(float(accum_units), int(motor_id))
-    if int(motor_id) in RIGHT_HAND_EXTRA_INVERT_MOTOR_IDS:
-        return -delta
-    return delta
+    """Leader→follower delta with record invert, right-hand sign flips, then elbow offset."""
+    mid = int(motor_id)
+    delta = accum_units_to_target_delta_rad(float(accum_units), mid)
+    if mid in RIGHT_HAND_EXTRA_INVERT_MOTOR_IDS:
+        delta = -delta
+    # Motors 7 (left) / 8 (right): +0.11 rad after all sign flips.
+    return delta + follower_command_offset_rad(mid)
 
 
 def select_right_leader_motors(all_motors: list) -> list:
@@ -114,6 +119,121 @@ def leader8_to_follower16(
     return targets
 
 
+class _FollowerPrintWorker:
+    """
+    Background printer for leader/follower diagnostics.
+
+    The teleop thread only publishes a snapshot (no print I/O). Follower qpos in
+    the snapshot is the same-tick ``ActuatorController.read_joints`` feedback
+    already used for safety — no second CAN read on this thread (buses are not
+    thread-safe).
+    """
+
+    def __init__(
+        self,
+        *,
+        print_every: int,
+        no_print_follower: bool,
+        print_follower_precision: int,
+        print_follower_qpos: bool,
+        print_follower_qpos_precision: int,
+        dry_run: bool,
+    ) -> None:
+        self._print_every = max(0, int(print_every))
+        self._no_print_follower = bool(no_print_follower)
+        self._print_follower_precision = max(0, int(print_follower_precision))
+        self._print_follower_qpos = bool(print_follower_qpos)
+        self._print_follower_qpos_precision = max(0, int(print_follower_qpos_precision))
+        self._dry_run = bool(dry_run)
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._pending = False
+        self._snap: dict | None = None
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._print_every <= 0:
+            return
+        self._thread = threading.Thread(
+            target=self._run, name="follower-print", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self, timeout_s: float = 1.0) -> None:
+        self._stop.set()
+        t = self._thread
+        if t is not None and t.is_alive():
+            t.join(timeout=timeout_s)
+
+    def publish(
+        self,
+        *,
+        loop_n: int,
+        leader8: list[float],
+        action16: np.ndarray,
+        qpos16: np.ndarray | None,
+        ramped_preview: dict | None = None,
+    ) -> None:
+        if self._print_every <= 0 or (loop_n % self._print_every) != 0:
+            return
+        with self._lock:
+            self._snap = {
+                "loop_n": int(loop_n),
+                "leader8": list(leader8),
+                "action16": np.asarray(action16, dtype=np.float64).copy(),
+                "qpos16": (
+                    None
+                    if qpos16 is None
+                    else np.asarray(qpos16, dtype=np.float64).reshape(-1).copy()
+                ),
+                "ramped_preview": dict(ramped_preview) if ramped_preview else None,
+            }
+            self._pending = True
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            snap = None
+            with self._lock:
+                if self._pending and self._snap is not None:
+                    snap = self._snap
+                    self._pending = False
+            if snap is None:
+                self._stop.wait(0.01)
+                continue
+            self._emit(snap)
+
+    def _emit(self, snap: dict) -> None:
+        leader_str = "[" + ", ".join(f"{x:.2f}" for x in snap["leader8"]) + "]"
+        msg = f"[right_teleop] loop #{snap['loop_n']} leader8={leader_str}"
+        if self._dry_run and snap.get("ramped_preview"):
+            msg += f" | target_preview={snap['ramped_preview']}"
+        print(msg, flush=True)
+
+        qpos16 = snap.get("qpos16")
+        if not self._no_print_follower:
+            if qpos16 is not None and qpos16.size >= NUM_JOINTS:
+                right_vals = qpos16[ARM_DOF:NUM_JOINTS]
+                follower_str = ", ".join(
+                    f"{float(v):.{self._print_follower_precision}f}" for v in right_vals
+                )
+                print(f"               follower_right8=[{follower_str}]", flush=True)
+            else:
+                print("               follower_right8=<no feedback snapshot>", flush=True)
+
+        if self._print_follower_qpos:
+            action16 = snap["action16"]
+            if qpos16 is None:
+                qpos16 = np.zeros(NUM_JOINTS, dtype=np.float64)
+            if qpos16.size < NUM_JOINTS:
+                qpos16 = np.pad(qpos16, (0, NUM_JOINTS - qpos16.size))
+            print_follower_qpos_action_block(
+                loop_n=snap["loop_n"],
+                qpos16=qpos16[:NUM_JOINTS],
+                action16=action16,
+                precision=self._print_follower_qpos_precision,
+            )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -139,15 +259,10 @@ def main() -> None:
     parser.add_argument(
         "--print-follower-qpos",
         action="store_true",
-        help="Print full diagnostic qpos/action block via follower_qpos_reader.",
+        help="Print full diagnostic qpos/action block on a background thread "
+             "(uses same-tick safety feedback; no extra CAN reads).",
     )
     parser.add_argument("--print-follower-qpos-precision", type=int, default=4)
-    parser.add_argument("--follower-qpos-after-writes", action="store_true")
-    parser.add_argument("--follower-can-read-retries", type=int, default=8)
-    parser.add_argument("--follower-can-read-retry-delay-ms", type=float, default=1.0)
-    parser.add_argument("--follower-mit-sweep-timeout-s", type=float, default=0.4)
-    parser.add_argument("--follower-mit-sweep-max-frames", type=int, default=320)
-    parser.add_argument("--verbose-follower-can-reads", action="store_true")
     parser.add_argument(
         "--skip-zero-pose",
         action="store_true",
@@ -164,8 +279,6 @@ def main() -> None:
     ensure_import_paths(project_root)
 
     from dynamixel_easy_sdk import Connector
-
-    follower_qpos_read_before_writes = not args.follower_qpos_after_writes
 
     print(f"Opening leader port {args.leader_port} @ {args.leader_baud}...")
     connector = Connector(args.leader_port, args.leader_baud)
@@ -188,7 +301,8 @@ def main() -> None:
     print(
         f"Gripper scale={GRIPPER_MOTION_SCALE} (motor {RIGHT_GRIPPER_MOTOR_ID}); "
         f"effective invert (right) = {sorted(effective_invert)} "
-        f"(extra flips vs record: {sorted(RIGHT_HAND_EXTRA_INVERT_MOTOR_IDS)})"
+        f"(extra flips vs record: {sorted(RIGHT_HAND_EXTRA_INVERT_MOTOR_IDS)}); "
+        f"command offsets rad={ {k: FOLLOWER_COMMAND_OFFSET_RAD[k] for k in (7, 8) if k in FOLLOWER_COMMAND_OFFSET_RAD} }"
     )
 
     for m in leader_motors:
@@ -247,19 +361,19 @@ def main() -> None:
         left_motors = [(f"motor_{mid}", mid) for mid in LEFT_ROBSTRIDE_IDS]
         right_motors = [(f"motor_{mid}", mid) for mid in RIGHT_ROBSTRIDE_IDS]
 
-    qpos_reader = None
-    if args.print_follower_qpos and not args.dry_run and (left_bus or right_bus):
-        from follower_qpos_reader import ResilientFollowerQposReader
-        from move_actuators import _load_robstride
-
-        _, _, ParameterType = _load_robstride()
-        qpos_reader = ResilientFollowerQposReader(
-            ParameterType,
-            can_read_retries=args.follower_can_read_retries,
-            can_read_retry_delay_s=max(0.0, args.follower_can_read_retry_delay_ms / 1000.0),
-            mit_sweep_timeout_s=args.follower_mit_sweep_timeout_s,
-            mit_sweep_max_frames=args.follower_mit_sweep_max_frames,
-            verbose=args.verbose_follower_can_reads,
+    printer = _FollowerPrintWorker(
+        print_every=args.print_every,
+        no_print_follower=args.no_print_follower,
+        print_follower_precision=args.print_follower_precision,
+        print_follower_qpos=args.print_follower_qpos,
+        print_follower_qpos_precision=args.print_follower_qpos_precision,
+        dry_run=args.dry_run,
+    )
+    printer.start()
+    if args.print_every > 0:
+        print(
+            "[right_teleop] Follower/leader print runs on a background thread "
+            "(snapshot from safety feedback; no extra CAN reads)."
         )
 
     print("Mode:", "DRY-RUN" if args.dry_run else "LIVE")
@@ -309,18 +423,6 @@ def main() -> None:
 
             targets = leader8_to_follower16(accum, robstride_ref, left_motors, right_motors)
 
-            will_print = args.print_every > 0 and (loops + 1) % args.print_every == 0
-            qpos_log: np.ndarray | None = None
-            if (
-                will_print
-                and args.print_follower_qpos
-                and qpos_reader is not None
-                and follower_qpos_read_before_writes
-            ):
-                qpos_log = qpos_reader.read_qpos12(
-                    left_bus, right_bus, left_motors, right_motors, _caller="right_before_writes"
-                )
-
             raw_encoder: np.ndarray | None = None
             if arm is not None:
                 try:
@@ -329,55 +431,21 @@ def main() -> None:
                     print(f"[right_teleop] encoder read failed before command: {e}")
                     raw_encoder = None
                 arm.command_joints(targets, ramp=True, feedback12=raw_encoder)
-            ramped_cmd = arm._ramped if arm is not None else {}
-
-            if (
-                will_print
-                and args.print_follower_qpos
-                and qpos_reader is not None
-                and not follower_qpos_read_before_writes
-            ):
-                qpos_log = qpos_reader.read_qpos12(
-                    left_bus, right_bus, left_motors, right_motors, _caller="right_after_writes"
-                )
 
             loops += 1
-            if args.print_every > 0 and loops % args.print_every == 0:
-                leader_str = "[" + ", ".join(f"{x:.2f}" for x in a8) + "]"
-                msg = f"[right_teleop] loop #{loops} leader8={leader_str}"
+            if args.print_every > 0 and (loops % args.print_every) == 0:
+                ramped_cmd = arm._ramped if arm is not None else {}
+                action16 = ramped_cmd_to_action16(left_motors, right_motors, ramped_cmd)
+                preview = None
                 if args.dry_run:
                     preview = {k: round(v, 4) for k, v in list(ramped_cmd.items())[:4]}
-                    msg += f" | target_preview={preview}"
-                print(msg)
-                if not args.no_print_follower and arm is not None:
-                    try:
-                        fq = raw_encoder if raw_encoder is not None else arm.read_joints()
-                        prec = max(0, args.print_follower_precision)
-                        # Print right half prominently
-                        right_vals = np.asarray(fq, dtype=np.float64).reshape(-1)[ARM_DOF:NUM_JOINTS]
-                        follower_str = ", ".join(f"{float(v):.{prec}f}" for v in right_vals)
-                        print(f"               follower_right8=[{follower_str}]")
-                    except Exception as e:
-                        print(f"               follower_right8 read failed: {e}")
-                if args.print_follower_qpos:
-                    action16 = ramped_cmd_to_action16(left_motors, right_motors, ramped_cmd)
-                    qpos16 = (
-                        np.asarray(qpos_log, dtype=np.float64).reshape(-1)
-                        if qpos_log is not None
-                        else (
-                            np.asarray(raw_encoder, dtype=np.float64).reshape(-1)
-                            if raw_encoder is not None
-                            else np.zeros(NUM_JOINTS, dtype=np.float64)
-                        )
-                    )
-                    if qpos16.size < NUM_JOINTS:
-                        qpos16 = np.pad(qpos16, (0, NUM_JOINTS - qpos16.size))
-                    print_follower_qpos_action_block(
-                        loop_n=loops,
-                        qpos16=qpos16[:NUM_JOINTS],
-                        action16=action16,
-                        precision=max(0, args.print_follower_qpos_precision),
-                    )
+                printer.publish(
+                    loop_n=loops,
+                    leader8=a8,
+                    action16=action16,
+                    qpos16=raw_encoder,
+                    ramped_preview=preview,
+                )
 
             elapsed = time.monotonic() - t0
             slp = loop_period - elapsed
@@ -387,8 +455,7 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nStopped by user.")
     finally:
-        if qpos_reader is not None:
-            print(qpos_reader.stats_line(), flush=True)
+        printer.stop()
         if arm is not None:
             try:
                 print(arm.read_stats_line(), flush=True)

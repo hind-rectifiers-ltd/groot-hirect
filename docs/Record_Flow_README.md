@@ -11,6 +11,8 @@ This folder contains the exact workflow used for a custom 3-camera humanoid setu
 
 Use this as an actionable runbook from data collection to real robot rollout.
 
+**Multiple skills (task 2+):** see [`docs/Multi_record_flow_guide.md`](Multi_record_flow_guide.md) for which env vars change per task, per-folder recording, staging, and one shared fine-tune.
+
 ## Tools in this folder
 
 - `record/record_episodes_3cam.py`: records raw HDF5 episodes.

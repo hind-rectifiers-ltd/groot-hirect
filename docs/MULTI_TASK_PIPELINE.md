@@ -321,6 +321,7 @@ Before live runs:
 
 ## 11. Related docs in this repo
 
+- [`Multi_record_flow_guide.md`](Multi_record_flow_guide.md) — **ordered commands**: per-skill folders → stage → convert → multi-task finetune → deploy
 - [`task_dictionary.md`](task_dictionary.md) — starter multi-task skill list, episode counts, variation plans
 - [`Record_Flow_README.md`](Record_Flow_README.md) / [`record/README.md`](../record/README.md) — record, convert, finetune, open-loop, inference
 - [`getting_started/data_preparation.md`](../getting_started/data_preparation.md) — LeRobot / `tasks.jsonl` schema

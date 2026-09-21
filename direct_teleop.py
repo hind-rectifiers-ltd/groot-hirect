@@ -111,6 +111,10 @@ LEADER_TO_FOLLOWER_ARM_INDEX = (0, 1, 2, 3, 4, 7)
 # Matches historical 12-DoF invert set; grippers moved from IDs 11/12 → 15/16.
 INVERT_DELTA_MOTOR_IDS = {1, 2, 5, 6, 7, 8, 9, 10, 15, 16}
 
+# Constant added to follower command (after invert) for elbow_roll L/R.
+# Compensates small leader/follower pose mismatch on motors 7 (left) and 8 (right).
+FOLLOWER_COMMAND_OFFSET_RAD: dict[int, float] = {7: 0.11, 8: 0.25}
+
 # ---------------------------------------------------------------------------
 # Helpers kept in this file (leader / teleop-specific logic)
 # ---------------------------------------------------------------------------
@@ -142,6 +146,11 @@ def accum_units_to_target_delta_rad(accum_units: float, motor_id: int, servo_idx
     if motor_id in INVERT_DELTA_MOTOR_IDS:
         return -delta_rad
     return delta_rad
+
+
+def follower_command_offset_rad(motor_id: int) -> float:
+    """Extra radians added to the follower target after leader→follower mapping."""
+    return float(FOLLOWER_COMMAND_OFFSET_RAD.get(int(motor_id), 0.0))
 
 
 def leader12_to_follower16(
@@ -177,8 +186,10 @@ def leader12_to_follower16(
         motor_name, motor_id = left_motors[follower_i]
         servo_idx = LEFT_LEADER_SERVO_INDICES[leader_i]
         base = _ref(motor_name, follower_i)
-        targets[follower_i] = base + accum_units_to_target_delta_rad(
-            float(accum[servo_idx]), motor_id, servo_idx
+        targets[follower_i] = (
+            base
+            + accum_units_to_target_delta_rad(float(accum[servo_idx]), motor_id, servo_idx)
+            + follower_command_offset_rad(motor_id)
         )
 
     # Right arm: same pattern, offset by ARM_DOF
@@ -187,8 +198,10 @@ def leader12_to_follower16(
         motor_name, motor_id = right_motors[follower_i]
         servo_idx = RIGHT_LEADER_SERVO_INDICES[leader_i]
         base = _ref(motor_name, abs_i)
-        targets[abs_i] = base + accum_units_to_target_delta_rad(
-            float(accum[servo_idx]), motor_id, servo_idx
+        targets[abs_i] = (
+            base
+            + accum_units_to_target_delta_rad(float(accum[servo_idx]), motor_id, servo_idx)
+            + follower_command_offset_rad(motor_id)
         )
 
     # Park missing wrist DoFs at teleop-zero follower ref (relative hold).
