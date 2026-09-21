@@ -3,8 +3,8 @@
 This folder contains the exact workflow used for a custom 3-camera humanoid setup:
 
 - Cameras: `cam_head`, `cam_left_wrist`, `cam_right_wrist`
-- Leader: `12` Dynamixels (`5 arm + 1 gripper` per side)
-- Follower / recorded joints: `16` DoF (`7 arm + 1 gripper` per side); missing leader wrist_roll/yaw map to follower `0`
+- Leader: `16` Dynamixels (`7 arm + 1 gripper` per side; IDs 1,3,…,15 / 2,4,…,16)
+- Follower / recorded joints: `16` DoF (`7 arm + 1 gripper` per side), 1:1 with leader
 - Raw capture format: `episode_XXXXXX.hdf5`
 - Training format: GR00T-compatible LeRobot v2.1
 - Embodiment tag: `NEW_EMBODIMENT` (registered by `record/custom_3cam_config.py`)

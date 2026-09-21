@@ -24,7 +24,7 @@ RIGHT_ARM_SLICE = slice(8, 15)
 RIGHT_GRIPPER_INDEX = 15
 GRIPPER_JOINT_INDICES = (LEFT_GRIPPER_INDEX, RIGHT_GRIPPER_INDEX)
 
-# Wrist roll / yaw (no leader servos yet) — keep at zero when mapping from 5+1.
+# Wrist roll / yaw indices (legacy 5+1 mapping inserted zeros here; 7+1 drives them).
 ZERO_FOLLOWER_INDICES = (5, 6, 13, 14)
 
 ACTION_KEYS = ("left_arm", "left_gripper", "right_arm", "right_gripper")

@@ -19,9 +19,8 @@ Expected camera names:
 Expected state/action ordering (default 16D, matching direct_teleop):
   [left_arm(7), left_gripper(1), right_arm(7), right_gripper(1)]
 
-Leader is still 5+1 Dynamixels per arm (12 total). Missing follower wrist_roll /
-wrist_yaw joints are held at the teleop-zero follower refs (see
-``direct_teleop.leader12_to_follower16``) — not absolute encoder 0.
+Leader: 16 Dynamixels = 7 arm + 1 gripper per side (IDs 1,3,…,15 / 2,4,…,16),
+mapped 1:1 onto the follower via ``direct_teleop.leader16_to_follower16``.
 """
 
 from __future__ import annotations
@@ -277,8 +276,8 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
     3-camera backend + direct local teleop loop (leader Dynamixel -> follower RobStride).
 
     Layout matches ``direct_teleop.py``:
-      - Leader: 5 arm + 1 gripper per side (12 Dynamixels)
-      - Follower: 7 arm + 1 gripper per side (16 RobStride); wrist_roll/yaw held at teleop-zero refs
+      - Leader: 7 arm + 1 gripper per side (16 Dynamixels)
+      - Follower: 7 arm + 1 gripper per side (16 RobStride), 1:1 by motor ID
 
     Motor I/O is delegated to ``move_actuators.ActuatorController`` (ramp + safety clamp).
 
@@ -322,9 +321,14 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
         from dynamixel_easy_sdk import Connector
 
         self._connector = Connector(leader_port, leader_baud)
-        self._leader_motors = self._connector.createAllMotors()
-        if not self._leader_motors:
+        all_leader = self._connector.createAllMotors()
+        if not all_leader:
             raise RuntimeError("No leader Dynamixel motors found")
+        self._leader_motors = dt.select_leader_motors(all_leader)
+        print(
+            f"[record] Leader motors (L then R): {[m.id for m in self._leader_motors]}",
+            flush=True,
+        )
         for m in self._leader_motors:
             try:
                 m.disableTorque()
@@ -399,8 +403,8 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
         )
         self._thread.start()
         print(
-            f"[record] Teleop layout: leader {self._leader_num}D (5+1/arm) -> "
-            f"follower {self._num_joints}D (7+1/arm); safety_clamp={self._safety_clamp}",
+            f"[record] Teleop layout: leader {self._leader_num}D (7+1/arm) -> "
+            f"follower {self._num_joints}D (7+1/arm, 1:1); safety_clamp={self._safety_clamp}",
             flush=True,
         )
         if self._control_rate_hz >= 20.0:
@@ -516,7 +520,7 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
             t0 = time.monotonic()
             try:
                 angles = dt.get_joint_angles_from_motors(self._leader_motors)
-                a12 = dt.pad_leader12(angles)
+                a16 = dt.pad_leader16(angles)
                 if len(angles) < self._leader_num:
                     time.sleep(period)
                     continue
@@ -528,7 +532,7 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
                             samples=self._qpos_median_samples
                         ).astype(np.float64)
                         self._arm.seed_ramp_from_angles(robstride_ref)
-                    prev_servo = list(a12)
+                    prev_servo = list(a16)
                     teleop_initialized = True
                     # Seed published state with the initial follower pose.
                     with self._lock:
@@ -539,11 +543,11 @@ class DirectTeleopRobotInterface(USBVideoRobotInterface):
 
                 # Accumulate leader-side servo deltas (in raw servo units).
                 for i in range(self._leader_num):
-                    accum[i] += dt.shortest_delta_units(prev_servo[i], a12[i])
-                    prev_servo[i] = a12[i]
+                    accum[i] += dt.shortest_delta_units(prev_servo[i], a16[i])
+                    prev_servo[i] = a16[i]
 
-                # Map leader 5+1/arm → follower 7+1/arm (wrists held at teleop-zero refs).
-                targets = dt.leader12_to_follower16(
+                # Map leader 7+1/arm → follower 7+1/arm (1:1).
+                targets = dt.leader16_to_follower16(
                     accum,
                     robstride_ref,
                     self._left_motors_meta,

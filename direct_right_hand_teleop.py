@@ -30,19 +30,20 @@ import numpy as np
 
 from direct_teleop import (
     ARM_DOF,
+    EXTRA_INVERT_DELTA_MOTOR_IDS,
     FOLLOWER_COMMAND_OFFSET_RAD,
     GRIPPER_MOTION_SCALE,
     INVERT_DELTA_MOTOR_IDS,
     NUM_JOINTS,
     RIGHT_GRIPPER_MOTOR_ID,
+    RIGHT_HAND_EXTRA_INVERT_MOTOR_IDS,
     RIGHT_ROBSTRIDE_IDS,
     ROBSTRIDE_RAMP_DT_MAX_S,
     ROBSTRIDE_RAMP_MAX_SPEED_RAD_S,
     ActuatorController,
-    accum_units_to_target_delta_rad,
     ensure_import_paths,
-    follower_command_offset_rad,
     get_joint_angles_from_motors,
+    leader_delta_rad,
     print_follower_qpos_action_block,
     ramped_cmd_to_action16,
     shortest_delta_units,
@@ -54,19 +55,10 @@ RIGHT_LEADER_MOTOR_IDS: tuple[int, ...] = (2, 4, 6, 8, 10, 12, 14, 16)
 RIGHT_LEADER_NUM_JOINTS = len(RIGHT_LEADER_MOTOR_IDS)
 assert RIGHT_LEADER_NUM_JOINTS == len(RIGHT_ROBSTRIDE_IDS) == ARM_DOF
 
-# Flip these relative to ``direct_teleop.INVERT_DELTA_MOTOR_IDS`` (record baseline).
-# Calibrated for the 7+1 right-hand leader: shoulder_roll (4) and wrist_yaw (14).
-RIGHT_HAND_EXTRA_INVERT_MOTOR_IDS: frozenset[int] = frozenset({4, 14})
-
 
 def right_hand_delta_rad(accum_units: float, motor_id: int) -> float:
-    """Leader→follower delta with record invert, right-hand sign flips, then elbow offset."""
-    mid = int(motor_id)
-    delta = accum_units_to_target_delta_rad(float(accum_units), mid)
-    if mid in RIGHT_HAND_EXTRA_INVERT_MOTOR_IDS:
-        delta = -delta
-    # Motors 7 (left) / 8 (right): +0.11 rad after all sign flips.
-    return delta + follower_command_offset_rad(mid)
+    """Leader→follower delta (shared invert / extra flip / elbow offset path)."""
+    return leader_delta_rad(float(accum_units), int(motor_id))
 
 
 def select_right_leader_motors(all_motors: list) -> list:
@@ -301,8 +293,9 @@ def main() -> None:
     print(
         f"Gripper scale={GRIPPER_MOTION_SCALE} (motor {RIGHT_GRIPPER_MOTOR_ID}); "
         f"effective invert (right) = {sorted(effective_invert)} "
-        f"(extra flips vs record: {sorted(RIGHT_HAND_EXTRA_INVERT_MOTOR_IDS)}); "
-        f"command offsets rad={ {k: FOLLOWER_COMMAND_OFFSET_RAD[k] for k in (7, 8) if k in FOLLOWER_COMMAND_OFFSET_RAD} }"
+        f"(extra flips: {sorted(RIGHT_HAND_EXTRA_INVERT_MOTOR_IDS)}; "
+        f"full extra set={sorted(EXTRA_INVERT_DELTA_MOTOR_IDS)}); "
+        f"command offsets rad={dict(FOLLOWER_COMMAND_OFFSET_RAD)}"
     )
 
     for m in leader_motors:

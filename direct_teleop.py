@@ -9,26 +9,20 @@ Flow:
 - Read leader present positions from Dynamixel motors (raw units).
 - Use first sample as teleop zero (capture follower mechanical refs).
 - Accumulate shortest-path deltas in leader raw units.
-- Map leader 5+1 per arm → follower 7+1 per arm (16D) and drive via
+- Map leader 7+1 per arm → follower 7+1 per arm (16D, 1:1 by motor ID) via
   ``ActuatorController`` from ``move_actuators``.
 
-Leader vs follower layout (temporary until leader gets two more wrist servos):
-- Leader: 12 Dynamixels = 5 arm + 1 gripper per side.
-- Follower: 16 RobStride = 7 arm + 1 gripper per side
+Leader / follower layout:
+- Leader: 16 Dynamixels = 7 arm + 1 gripper per side
   (IDs 1,3,5,7,9,11,13,15 left / 2,4,6,8,10,12,14,16 right).
-- Follower wrist_roll / wrist_yaw (motors 11,12,13,14) are **held at the
-  follower pose captured at teleop zero** (no leader mapping). Do **not**
-  command absolute encoder 0 — that yanks joints whose mechanical home sits
-  near ±2π or any non-zero offset.
-- Follower grippers are motors 15 (left) and 16 (right).
+- Follower: 16 RobStride = same IDs, same order (1:1).
+- Grippers are motors 15 (left) and 16 (right).
 
 Matches ``record/record_episodes_3cam.py``: relative leader deltas, ramp seed
 from encoders, optional zero-pose preflight, and ``feedback12`` on every
-``command_joints`` so safety clamp uses a same-tick encoder read (not a stale
-or failed-zero read after MIT writes).
+``command_joints`` so safety clamp uses a same-tick encoder read.
 
-Optional: ``--print-follower-qpos`` uses ``record/follower_qpos_reader.py`` (retries,
-MIT status fallback, last-good per joint). See ``--help`` for tuning flags.
+Optional: ``--print-follower-qpos`` uses ``record/follower_qpos_reader.py``.
 """
 
 import argparse
@@ -41,24 +35,33 @@ from pathlib import Path
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# Leader (Dynamixel) constants — still 5 arm + 1 gripper per side (12 total)
+# Leader (Dynamixel) constants — 7 arm + 1 gripper per side (16 total)
 # ---------------------------------------------------------------------------
 
 SERVO_UNITS_PER_REV = 4096.0
 RAD_PER_SERVO_UNIT = 2.0 * math.pi / SERVO_UNITS_PER_REV
 
-# Leader Dynamixel → follower gripper gain (same on both sides; right verified correct).
+# Leader Dynamixel → follower gripper gain (same on both sides; right verified).
 GRIPPER_MOTION_SCALE = 5.0
-LEFT_GRIPPER_MOTION_SCALE = GRIPPER_MOTION_SCALE   # motor 15 / leader servo 10
-RIGHT_GRIPPER_MOTION_SCALE = GRIPPER_MOTION_SCALE  # motor 16 / leader servo 11
-# Leader Dynamixel indices for left/right grippers in the 12-vector pad order.
-LEFT_GRIPPER_SERVO_INDEX = 10
-RIGHT_GRIPPER_SERVO_INDEX = 11
+LEFT_GRIPPER_MOTION_SCALE = GRIPPER_MOTION_SCALE   # motor 15
+RIGHT_GRIPPER_MOTION_SCALE = GRIPPER_MOTION_SCALE  # motor 16
+
+# Ordered leader IDs (1:1 with LEFT/RIGHT_ROBSTRIDE_IDS). Accum vector is L then R.
+LEFT_LEADER_MOTOR_IDS: tuple[int, ...] = (1, 3, 5, 7, 9, 11, 13, 15)
+RIGHT_LEADER_MOTOR_IDS: tuple[int, ...] = (2, 4, 6, 8, 10, 12, 14, 16)
+LEADER_MOTOR_IDS: tuple[int, ...] = LEFT_LEADER_MOTOR_IDS + RIGHT_LEADER_MOTOR_IDS
+LEADER_NUM_JOINTS = len(LEADER_MOTOR_IDS)  # 16
+
+# Indices inside the L-then-R leader accum vector (grippers = last slot per arm).
+LEFT_GRIPPER_SERVO_INDEX = len(LEFT_LEADER_MOTOR_IDS) - 1   # 7
+RIGHT_GRIPPER_SERVO_INDEX = len(LEFT_LEADER_MOTOR_IDS) + len(RIGHT_LEADER_MOTOR_IDS) - 1  # 15
 GRIPPER_SERVO_INDICES = {LEFT_GRIPPER_SERVO_INDEX, RIGHT_GRIPPER_SERVO_INDEX}
-LEADER_NUM_JOINTS = 12
-# Leader servo index order per arm (interleaved L/R in the 12-vector).
-LEFT_LEADER_SERVO_INDICES = (0, 2, 4, 6, 8, 10)   # 5 arm + gripper
-RIGHT_LEADER_SERVO_INDICES = (1, 3, 5, 7, 9, 11)
+
+# Back-compat names used by older call sites (same as motor-ID order slices).
+LEFT_LEADER_SERVO_INDICES = tuple(range(len(LEFT_LEADER_MOTOR_IDS)))
+RIGHT_LEADER_SERVO_INDICES = tuple(
+    range(len(LEFT_LEADER_MOTOR_IDS), LEADER_NUM_JOINTS)
+)
 
 # ---------------------------------------------------------------------------
 # Re-export arm layout constants from move_actuators for callers that import
@@ -92,43 +95,61 @@ LEFT_GRIPPER_MOTOR_ID = 15
 RIGHT_GRIPPER_MOTOR_ID = 16
 GRIPPER_MOTOR_IDS = {LEFT_GRIPPER_MOTOR_ID, RIGHT_GRIPPER_MOTOR_ID}
 
-# Follower wrist_roll / wrist_yaw — no leader servos yet → hold teleop-zero ref.
-ZERO_FOLLOWER_MOTOR_IDS = {11, 12, 13, 14}
-# Indices inside the 16-vector: left wrist_roll/yaw = 5,6 ; right = 13,14
-ZERO_FOLLOWER_INDICES = (5, 6, 13, 14)
-
 # Pre-flight: follower joints must be near home (same window as record_episodes_3cam).
 ZERO_POSE_LOW_RAD = -0.2
 ZERO_POSE_HIGH_RAD = 0.2
 
-# Leader 5+1 → which follower joint index (within one arm's 8 slots) each maps to.
-# Follower arm order: shoulder_pitch, shoulder_roll, shoulder_yaw, elbow_roll,
-#                     wrist_pitch, wrist_roll, wrist_yaw, gripper
-# Leader drives:      0,1,2,3,4, then skip 5,6, gripper→7
-LEADER_TO_FOLLOWER_ARM_INDEX = (0, 1, 2, 3, 4, 7)
-
 # Leader→follower sign flips (raw Dynamixel delta → follower joint delta).
-# Matches historical 12-DoF invert set; grippers moved from IDs 11/12 → 15/16.
 INVERT_DELTA_MOTOR_IDS = {1, 2, 5, 6, 7, 8, 9, 10, 15, 16}
 
-# Constant added to follower command (after invert) for elbow_roll L/R.
-# Compensates small leader/follower pose mismatch on motors 7 (left) and 8 (right).
+# Extra flips on top of INVERT_DELTA (7+1 leader calibration).
+# Right: shoulder_roll (4), wrist_yaw (14) — verified in direct_right_hand_teleop.
+# Left: mirrored joints shoulder_roll (3), wrist_yaw (13).
+EXTRA_INVERT_DELTA_MOTOR_IDS: frozenset[int] = frozenset({3, 4, 13, 14})
+# Back-compat alias used by direct_right_hand_teleop.
+RIGHT_HAND_EXTRA_INVERT_MOTOR_IDS = frozenset({4, 14})
+
+# Constant added to follower command (after all sign flips) for elbow_roll L/R.
 FOLLOWER_COMMAND_OFFSET_RAD: dict[int, float] = {7: 0.11, 8: 0.25}
+
+# Legacy names kept so older imports do not break (wrists are driven now).
+ZERO_FOLLOWER_MOTOR_IDS: set[int] = set()
+ZERO_FOLLOWER_INDICES: tuple[int, ...] = ()
+# 1:1 within each arm's 8 slots.
+LEADER_TO_FOLLOWER_ARM_INDEX = tuple(range(ARM_DOF))
+
+assert len(LEFT_LEADER_MOTOR_IDS) == len(LEFT_ROBSTRIDE_IDS) == ARM_DOF
+assert len(RIGHT_LEADER_MOTOR_IDS) == len(RIGHT_ROBSTRIDE_IDS) == ARM_DOF
+assert LEADER_NUM_JOINTS == NUM_JOINTS
 
 # ---------------------------------------------------------------------------
 # Helpers kept in this file (leader / teleop-specific logic)
 # ---------------------------------------------------------------------------
 
-def pad_leader12(angles):
-    """Pad/truncate Dynamixel readings to the 12-DoF leader vector."""
+def select_leader_motors(all_motors: list) -> list:
+    """Pick Dynamixels for both arms in L-then-R ID order (1:1 with follower)."""
+    by_id = {int(m.id): m for m in all_motors}
+    missing = [mid for mid in LEADER_MOTOR_IDS if mid not in by_id]
+    if missing:
+        found = sorted(by_id.keys())
+        raise RuntimeError(
+            f"Leader missing Dynamixel ID(s) {missing}. "
+            f"Found IDs: {found}. Expected: {list(LEADER_MOTOR_IDS)}"
+        )
+    return [by_id[mid] for mid in LEADER_MOTOR_IDS]
+
+
+def pad_leader16(angles):
+    """Pad/truncate Dynamixel readings to the 16-DoF leader vector (L then R)."""
     a = [float(x) for x in angles]
     while len(a) < LEADER_NUM_JOINTS:
         a.append(0.0)
     return a[:LEADER_NUM_JOINTS]
 
 
-# Back-compat alias used by record_episodes_3cam.py
-pad12 = pad_leader12
+# Back-compat aliases used by record_episodes_3cam.py
+pad_leader12 = pad_leader16
+pad12 = pad_leader16
 
 
 def shortest_delta_units(prev_u: float, curr_u: float, period: float = SERVO_UNITS_PER_REV) -> float:
@@ -153,23 +174,30 @@ def follower_command_offset_rad(motor_id: int) -> float:
     return float(FOLLOWER_COMMAND_OFFSET_RAD.get(int(motor_id), 0.0))
 
 
-def leader12_to_follower16(
-    accum12: list[float] | np.ndarray,
+def leader_delta_rad(accum_units: float, motor_id: int, servo_idx: int | None = None) -> float:
+    """
+    Full leader→follower delta: base invert, extra 7+1 flips, then elbow offset.
+    """
+    mid = int(motor_id)
+    delta = accum_units_to_target_delta_rad(float(accum_units), mid, servo_idx)
+    if mid in EXTRA_INVERT_DELTA_MOTOR_IDS:
+        delta = -delta
+    return delta + follower_command_offset_rad(mid)
+
+
+def leader16_to_follower16(
+    accum16: list[float] | np.ndarray,
     robstride_ref16: dict[str, float] | np.ndarray,
     left_motors: list[tuple[str, int]],
     right_motors: list[tuple[str, int]],
 ) -> np.ndarray:
     """
-    Map leader 12-DoF accumulated deltas + follower refs → 16-DoF command vector.
+    Map leader 16-DoF accumulated deltas + follower refs → 16-DoF command vector.
 
-    All follower joints are **relative to** ``robstride_ref16`` (pose at teleop
-    zero). Wrist_roll / wrist_yaw have no leader servos, so they stay at that
-    ref (held). Never write absolute encoder 0 for those joints — mechanical
-    home is often a small offset or a ±2π wrap, and absolute 0 yanks the wrist.
-
-    Grippers 15/16 are driven from leader servo indices 10/11.
+    Accum order is left IDs then right IDs (see ``LEADER_MOTOR_IDS``). Each
+    follower joint is relative to ``robstride_ref16`` (pose at teleop zero).
     """
-    accum = np.asarray(accum12, dtype=np.float64).reshape(-1)
+    accum = np.asarray(accum16, dtype=np.float64).reshape(-1)
     if accum.size < LEADER_NUM_JOINTS:
         accum = np.pad(accum, (0, LEADER_NUM_JOINTS - accum.size))
 
@@ -181,38 +209,20 @@ def leader12_to_follower16(
         ref = np.asarray(robstride_ref16, dtype=np.float64).reshape(-1)
         return float(ref[fallback_idx]) if fallback_idx < len(ref) else 0.0
 
-    # Left arm: leader 5+1 → follower slots 0..4 and 7; wrists 5,6 held at ref
-    for leader_i, follower_i in enumerate(LEADER_TO_FOLLOWER_ARM_INDEX):
-        motor_name, motor_id = left_motors[follower_i]
-        servo_idx = LEFT_LEADER_SERVO_INDICES[leader_i]
-        base = _ref(motor_name, follower_i)
-        targets[follower_i] = (
-            base
-            + accum_units_to_target_delta_rad(float(accum[servo_idx]), motor_id, servo_idx)
-            + follower_command_offset_rad(motor_id)
-        )
+    for i, (motor_name, motor_id) in enumerate(left_motors):
+        base = _ref(motor_name, i)
+        targets[i] = base + leader_delta_rad(float(accum[i]), motor_id, i)
 
-    # Right arm: same pattern, offset by ARM_DOF
-    for leader_i, follower_i in enumerate(LEADER_TO_FOLLOWER_ARM_INDEX):
-        abs_i = ARM_DOF + follower_i
-        motor_name, motor_id = right_motors[follower_i]
-        servo_idx = RIGHT_LEADER_SERVO_INDICES[leader_i]
+    for i, (motor_name, motor_id) in enumerate(right_motors):
+        abs_i = ARM_DOF + i
         base = _ref(motor_name, abs_i)
-        targets[abs_i] = (
-            base
-            + accum_units_to_target_delta_rad(float(accum[servo_idx]), motor_id, servo_idx)
-            + follower_command_offset_rad(motor_id)
-        )
-
-    # Park missing wrist DoFs at teleop-zero follower ref (relative hold).
-    for idx in ZERO_FOLLOWER_INDICES:
-        if idx < ARM_DOF:
-            motor_name, _ = left_motors[idx]
-        else:
-            motor_name, _ = right_motors[idx - ARM_DOF]
-        targets[idx] = _ref(motor_name, idx)
+        targets[abs_i] = base + leader_delta_rad(float(accum[abs_i]), motor_id, abs_i)
 
     return targets
+
+
+# Back-compat alias
+leader12_to_follower16 = leader16_to_follower16
 
 
 def verify_follower_zero_pose(
@@ -239,7 +249,7 @@ def verify_follower_zero_pose(
             "Follower pre-teleop zero-pose check failed:\n"
             + details
             + "\nMove the follower arm(s) back to home position (~0 rad) and re-run, "
-            "or pass --skip-zero-pose (wrists will still hold teleop-zero refs)."
+            "or pass --skip-zero-pose."
         )
 
 
@@ -295,16 +305,16 @@ _FOLLOWER_JOINT_LABELS_16 = (
     "L2",
     "L3",
     "L4",
-    "L5",  # wrist_roll  (motor 11) — held at 0
-    "L6",  # wrist_yaw   (motor 13) — held at 0
+    "L5",  # wrist_roll  (motor 11)
+    "L6",  # wrist_yaw   (motor 13)
     "Lg",
     "R0",
     "R1",
     "R2",
     "R3",
     "R4",
-    "R5",  # wrist_roll  (motor 12) — held at 0
-    "R6",  # wrist_yaw   (motor 14) — held at 0
+    "R5",  # wrist_roll  (motor 12)
+    "R6",  # wrist_yaw   (motor 14)
     "Rg",
 )
 
@@ -378,8 +388,7 @@ def main():
     parser.add_argument(
         "--skip-zero-pose",
         action="store_true",
-        help="Skip follower home check before live teleop (record always enforces this). "
-             "Wrist joints still hold the pose captured at teleop zero (relative), not absolute 0.",
+        help="Skip follower home check before live teleop (record always enforces this).",
     )
     parser.add_argument(
         "--safety-abort",
@@ -399,14 +408,16 @@ def main():
     connector = Connector(args.leader_port, args.leader_baud)
 
     print("Scanning leader motors...")
-    leader_motors = connector.createAllMotors()
-    if not leader_motors:
+    all_leader = connector.createAllMotors()
+    if not all_leader:
         raise RuntimeError("No leader Dynamixel motors found")
-    print(f"Found {len(leader_motors)} leader motors: {[m.id for m in leader_motors]}")
+    print(f"Found {len(all_leader)} leader motors: {[m.id for m in all_leader]}")
+    leader_motors = select_leader_motors(all_leader)
     print(
-        f"Follower layout: {NUM_JOINTS} DoF (7+1 per arm). "
-        f"Holding wrist motors {sorted(ZERO_FOLLOWER_MOTOR_IDS)} at teleop-zero refs; "
-        f"grippers = {sorted(GRIPPER_MOTOR_IDS)}."
+        f"Using leaders (L then R): {[m.id for m in leader_motors]} → "
+        f"followers {list(LEFT_ROBSTRIDE_IDS) + list(RIGHT_ROBSTRIDE_IDS)} (1:1). "
+        f"extra_invert={sorted(EXTRA_INVERT_DELTA_MOTOR_IDS)}; "
+        f"offsets={FOLLOWER_COMMAND_OFFSET_RAD}"
     )
 
     for m in leader_motors:
@@ -494,7 +505,7 @@ def main():
         while True:
             t0 = time.monotonic()
             angles = get_joint_angles_from_motors(leader_motors)
-            a12 = pad_leader12(angles)
+            a16 = pad_leader16(angles)
 
             if len(angles) < LEADER_NUM_JOINTS:
                 time.sleep(loop_period)
@@ -514,28 +525,24 @@ def main():
                 else:
                     for motor_name, _ in left_motors + right_motors:
                         robstride_ref[motor_name] = 0.0
-                prev_servo = list(a12)
+                prev_servo = list(a16)
                 teleop_initialized = True
                 last_ramp_t = time.monotonic()
                 print("Teleop zero set: captured follower refs (relative deltas from here).")
-                print(
-                    "  Note: follower wrist_roll/yaw (motors 11,12,13,14) held at those refs "
-                    "(not absolute encoder 0)."
-                )
                 continue
 
             # --- accumulate leader deltas (raw Dynamixel units, shortest path) ---
             for i in range(LEADER_NUM_JOINTS):
-                accum[i] += shortest_delta_units(prev_servo[i], a12[i])
-                prev_servo[i] = a12[i]
+                accum[i] += shortest_delta_units(prev_servo[i], a16[i])
+                prev_servo[i] = a16[i]
 
             now = time.monotonic()
             if last_ramp_t is None:
                 last_ramp_t = now
             last_ramp_t = now
 
-            # --- compute 16-vector desired targets (wrists hold teleop-zero refs) ---
-            targets = leader12_to_follower16(accum, robstride_ref, left_motors, right_motors)
+            # --- compute 16-vector desired targets (1:1 leader → follower) ---
+            targets = leader16_to_follower16(accum, robstride_ref, left_motors, right_motors)
 
             # --- optional diagnostic qpos (before writes when requested) ---
             will_print = args.print_every > 0 and (loops + 1) % args.print_every == 0
@@ -564,8 +571,8 @@ def main():
 
             loops += 1
             if args.print_every > 0 and loops % args.print_every == 0:
-                leader_str = "[" + ", ".join(f"{x:.2f}" for x in a12) + "]"
-                msg = f"[direct] loop #{loops} leader[:12]={leader_str}"
+                leader_str = "[" + ", ".join(f"{x:.2f}" for x in a16) + "]"
+                msg = f"[direct] loop #{loops} leader16={leader_str}"
                 if args.dry_run:
                     preview = {k: round(v, 4) for k, v in list(ramped_cmd.items())[:4]}
                     msg += f" | target_preview={preview}"
