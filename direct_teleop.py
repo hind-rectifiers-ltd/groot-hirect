@@ -110,7 +110,7 @@ EXTRA_INVERT_DELTA_MOTOR_IDS: frozenset[int] = frozenset({3, 4, 13, 14})
 RIGHT_HAND_EXTRA_INVERT_MOTOR_IDS = frozenset({4, 14})
 
 # Constant added to follower command (after all sign flips) for elbow_roll L/R.
-FOLLOWER_COMMAND_OFFSET_RAD: dict[int, float] = {7: 0.11, 8: 0.25}
+FOLLOWER_COMMAND_OFFSET_RAD: dict[int, float] = {7: -0.25, 8: 0.25}
 
 # Legacy names kept so older imports do not break (wrists are driven now).
 ZERO_FOLLOWER_MOTOR_IDS: set[int] = set()

@@ -32,7 +32,7 @@ Single-task command details (cameras, 30 Hz, safety): [`Record_Flow_README.md`](
 From repo root (adjust `SSD` if needed):
 
 ```bash
-export SSD=/media/yash/T7/pick_place_v1
+export SSD=/media/jetson/T7/pick_place_v1
 export HF_HOME="${SSD}/huggingface"
 export HF_LEROBOT_HOME="${SSD}/lerobot"
 export LEROBOT_ROOT="${HF_LEROBOT_HOME}"
