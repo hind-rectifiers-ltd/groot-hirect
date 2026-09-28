@@ -27,6 +27,15 @@ from typing import Any
 
 import numpy as np
 
+# Default: if no new frame arrives within this window, treat the camera as dead.
+# At 15–30 FPS a healthy cam updates every ~33–67 ms; 1.5 s is a clear stall.
+DEFAULT_CAMERA_STALE_TIMEOUT_S = 1.5
+
+
+class CameraStoppedError(RuntimeError):
+    """Raised when a USB camera stops delivering new frames."""
+
+
 # Logical names used by record_episodes_3cam / policy_client_3cam.
 THREE_CAM_ROLES = ("cam_head", "cam_left_wrist", "cam_right_wrist")
 
@@ -812,6 +821,8 @@ class _CameraGrabber(threading.Thread):
         self._fps_window_start = time.time()
         self._fps_window_ok = 0
         self._measured_fps = 0.0
+        self._frame_seq = 0
+        self._last_ok_mono = 0.0
 
     def run(self) -> None:
         while not self._stop_event.is_set():
@@ -825,6 +836,8 @@ class _CameraGrabber(threading.Thread):
             if ret and frame is not None and getattr(frame, "size", 0) > 0:
                 with self._lock:
                     self._frame = frame
+                    self._frame_seq += 1
+                    self._last_ok_mono = time.monotonic()
                 self._ok += 1
                 self._fps_window_ok += 1
                 now = time.time()
@@ -847,6 +860,18 @@ class _CameraGrabber(threading.Thread):
     def measured_fps(self) -> float:
         return float(self._measured_fps)
 
+    @property
+    def frame_seq(self) -> int:
+        with self._lock:
+            return int(self._frame_seq)
+
+    def seconds_since_ok(self) -> float:
+        with self._lock:
+            t = float(self._last_ok_mono)
+        if t <= 0.0:
+            return float("inf")
+        return max(0.0, time.monotonic() - t)
+
     def request_stop(self) -> None:
         self._stop_event.set()
 
@@ -866,6 +891,7 @@ class USBCameraRig:
         fps: float | None = None,
         threaded: bool = True,
         allow_usb2_fps_fallback: bool = True,
+        stale_timeout_s: float = DEFAULT_CAMERA_STALE_TIMEOUT_S,
     ):
         try:
             import cv2
@@ -877,6 +903,7 @@ class USBCameraRig:
         self._device_map = dict(device_map)
         self._caps: dict[str, Any] = {}
         self._grabbers: dict[str, _CameraGrabber] = {}
+        self._stale_timeout_s = float(max(0.2, stale_timeout_s))
         self._threaded = threaded
         # Default MJPEG for all opens. Multi-cam on a shared USB 2.0 hub cannot
         # sustain uncompressed YUYV; the last camera typically goes black.
@@ -988,12 +1015,46 @@ class USBCameraRig:
             if ret and got is not None:
                 frame = got
         if frame is None:
-            return np.zeros((h, w, 3), dtype=np.uint8)
+            raise CameraStoppedError(
+                f"camera stopped working: {cam_name} returned no frame "
+                f"(device={self._device_map.get(cam_name)!r})"
+            )
         if frame.shape[:2] != (h, w):
             frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_LINEAR)
         return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.uint8)
 
+    def assert_cameras_alive(
+        self,
+        camera_names: tuple[str, ...] | list[str] | None = None,
+        *,
+        stale_timeout_s: float | None = None,
+    ) -> None:
+        """
+        Raise ``CameraStoppedError`` if any camera has not delivered a new frame
+        within ``stale_timeout_s`` (default: rig ``stale_timeout_s``).
+        """
+        timeout = float(self._stale_timeout_s if stale_timeout_s is None else stale_timeout_s)
+        names = list(camera_names) if camera_names is not None else list(self._device_map.keys())
+        dead: list[str] = []
+        for name in names:
+            grabber = self._grabbers.get(name)
+            if grabber is None:
+                # Non-threaded path: only checked via None frame in read_rgb.
+                if name not in self._caps:
+                    dead.append(f"{name} (not open)")
+                continue
+            age = grabber.seconds_since_ok()
+            if grabber.frame_seq <= 0 or age > timeout:
+                dead.append(
+                    f"{name} (no new frame for {age:.2f}s, "
+                    f"measured_fps={grabber.measured_fps:.1f}, "
+                    f"device={self._device_map.get(name)!r})"
+                )
+        if dead:
+            raise CameraStoppedError("camera stopped working: " + "; ".join(dead))
+
     def read_all_rgb(self, camera_names: tuple[str, ...]) -> dict[str, np.ndarray]:
+        self.assert_cameras_alive(camera_names)
         return {cam: self.read_rgb(cam) for cam in camera_names}
 
     def measured_fps(self, cam_name: str) -> float:

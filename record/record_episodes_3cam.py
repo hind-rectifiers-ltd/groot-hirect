@@ -37,6 +37,8 @@ from typing import Any, Callable
 import h5py
 import numpy as np
 
+from usb_cameras import CameraStoppedError
+
 CAMERA_NAMES = ("cam_head", "cam_left_wrist", "cam_right_wrist")
 
 
@@ -1042,6 +1044,13 @@ def run_recording_session(
                     if n == 1 or n % 30 == 0:
                         print(f"\r[record] steps={n}", end="", flush=True)
                     time.sleep(max(0.0, dt - (time.time() - step_start)))
+            except CameraStoppedError as exc:
+                print(f"\n[record] FATAL: {exc}", flush=True)
+                print(
+                    f"[record] Aborting episode_{ep_idx:06d} without save; exiting session.",
+                    flush=True,
+                )
+                raise
             except KeyboardInterrupt:
                 stop_reason = "interrupt"
                 print("\n[record] Ctrl+C — stopping episode.", flush=True)
@@ -1290,6 +1299,14 @@ def main() -> None:
             include_effort=not args.no_effort,
             start_episode_idx=ep_idx,
         )
+    except CameraStoppedError as exc:
+        print(f"[session] {exc}", flush=True)
+        if hasattr(robot, "close"):
+            try:
+                robot.close()
+            except Exception:
+                pass
+        sys.exit(1)
     except Exception:
         # Session normally closes the robot in its finally; if connect failed earlier
         # or session raised before that, still try to release.
