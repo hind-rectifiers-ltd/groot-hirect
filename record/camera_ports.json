@@ -1,5 +1,5 @@
 {
   "cam_head": {"id_path_tag": "platform-3610000_usb-usb-0_4_2_3"},
-  "cam_left_wrist": {"id_path_tag": "platform-3610000_usb-usb-0_4_2_1"},
-  "cam_right_wrist": {"id_path_tag": "platform-3610000_usb-usb-0_4_2_2"}
+  "cam_left_wrist": {"id_path_tag": "platform-3610000_usb-usb-0_4_3"},
+  "cam_right_wrist": {"id_path_tag": "platform-3610000_usb-usb-0_4_4"}
 }
