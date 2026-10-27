@@ -8,8 +8,7 @@ Trinet Mono cameras (VID:PID 2207:0016) stream 1920x1080 MJPEG at 30 fps with an
 in-band IMU JPEG block. Capture is handled in ``record/trinet_capture.py`` (copied
 from the camera kit; this package does not import ``trinet_usb``). Each camera
 runs on its own grabber thread, IMU data is stripped, then the frame is
-center-cropped to a square and resized to the requested output
-(default 1080x1080, minimum useful size 720x720).
+center-cropped to the output aspect and resized (default 1980x720).
 """
 
 from __future__ import annotations
@@ -30,7 +29,8 @@ import numpy as np
 
 from trinet_capture import (
     MIN_OUTPUT_SIZE,
-    PREFERRED_OUTPUT_SIZE,
+    PREFERRED_OUTPUT_HEIGHT,
+    PREFERRED_OUTPUT_WIDTH,
     TRINET_NATIVE_FPS,
     configure_trinet_capture,
     crop_square_resize_rgb,
@@ -42,7 +42,9 @@ from trinet_capture import (
 # Default: if no new frame arrives within this window, treat the camera as dead.
 # At 15–30 FPS a healthy cam updates every ~33–67 ms; 1.5 s is a clear stall.
 DEFAULT_CAMERA_STALE_TIMEOUT_S = 1.5
-DEFAULT_IMAGE_SIZE = PREFERRED_OUTPUT_SIZE
+DEFAULT_IMAGE_HEIGHT = PREFERRED_OUTPUT_HEIGHT
+DEFAULT_IMAGE_WIDTH = PREFERRED_OUTPUT_WIDTH
+DEFAULT_IMAGE_SHAPE = (DEFAULT_IMAGE_HEIGHT, DEFAULT_IMAGE_WIDTH)
 
 
 class CameraStoppedError(RuntimeError):
@@ -612,7 +614,7 @@ def add_three_camera_cli_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "UVC capture FPS (default 30, matches Record_Flow 30 Hz). "
             "Trinet cameras natively stream 1920x1080 MJPEG at 30 fps; output is "
-            "center-cropped to a square (default 1080x1080). "
+            "center-cropped and resized to 1980x720. "
             "On a saturated USB 2.0 hub the rig auto-falls back to 15 fps. "
             "Prefer USB 3 for three cameras at 30 fps."
         ),
@@ -684,7 +686,7 @@ def _annotate_preview_frame(
 def run_camera_mapping_preview(
     device_map: dict[str, int | str],
     *,
-    image_shape: tuple[int, int] = (DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE),
+    image_shape: tuple[int, int] = DEFAULT_IMAGE_SHAPE,
     window_name: str = "GR00T: verify camera_ports.json (Esc=quit)",
     fps: float = 30.0,
 ) -> None:
@@ -727,7 +729,7 @@ def run_camera_mapping_preview(
             for role in THREE_CAM_ROLES:
                 rgb = rig.read_rgb(role)
                 bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-                # Keep the GUI panel small even when capturing 1080x1080.
+                # Keep the GUI panel small even when capturing 1980x720.
                 disp_h = min(bgr.shape[0], 480)
                 if bgr.shape[0] != disp_h:
                     disp_w = max(1, int(round(bgr.shape[1] * disp_h / bgr.shape[0])))
@@ -774,7 +776,7 @@ def run_camera_mapping_preview(
 
 
 def run_preview_all_working_cameras(
-    *, image_shape: tuple[int, int] = (DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE)
+    *, image_shape: tuple[int, int] = DEFAULT_IMAGE_SHAPE
 ) -> None:
     """Show each working camera one at a time with USB instance id (build camera_ports.json)."""
     import cv2
@@ -840,8 +842,8 @@ def run_preview_all_working_cameras(
 
 def run_camera_preview_from_args(args: argparse.Namespace) -> None:
     """Entry for --preview-cameras / --preview-all-cameras."""
-    h = int(getattr(args, "image_height", DEFAULT_IMAGE_SIZE))
-    w = int(getattr(args, "image_width", DEFAULT_IMAGE_SIZE))
+    h = int(getattr(args, "image_height", DEFAULT_IMAGE_HEIGHT))
+    w = int(getattr(args, "image_width", DEFAULT_IMAGE_WIDTH))
     shape = (h, w)
     if getattr(args, "preview_all_cameras", False):
         run_preview_all_working_cameras(image_shape=shape)
@@ -882,8 +884,8 @@ class _CameraGrabber(threading.Thread):
     """Continuously pull frames from one VideoCapture so read_rgb() is non-blocking.
 
     Each camera has its own thread. Trinet grabs keep CONVERT_RGB=0, strip the IMU
-    JPEG block, decode, then center-crop to the output square. The latest RGB frame
-    is stored so the record/policy loop never blocks on USB or JPEG decode.
+    JPEG block, decode, then center-crop/resize to the output shape. The latest RGB
+    frame is stored so the record/policy loop never blocks on USB or JPEG decode.
     """
 
     def __init__(
@@ -999,17 +1001,11 @@ class USBCameraRig:
 
         self._cv2 = cv2
         h_req, w_req = int(image_shape[0]), int(image_shape[1])
-        if h_req != w_req:
-            print(
-                f"[usb_cameras] WARNING: image_shape={image_shape} is not square; "
-                "Trinet frames are center-cropped to a square then resized.",
-                flush=True,
-            )
         if min(h_req, w_req) < MIN_OUTPUT_SIZE:
             print(
-                f"[usb_cameras] WARNING: output {h_req}x{w_req} is below the "
-                f"{MIN_OUTPUT_SIZE}x{MIN_OUTPUT_SIZE} minimum for this rig; "
-                f"prefer {PREFERRED_OUTPUT_SIZE}x{PREFERRED_OUTPUT_SIZE} @ 30 fps.",
+                f"[usb_cameras] WARNING: output {w_req}x{h_req} is below the "
+                f"{MIN_OUTPUT_SIZE}px minimum side for this rig; "
+                f"prefer {PREFERRED_OUTPUT_WIDTH}x{PREFERRED_OUTPUT_HEIGHT} @ 30 fps.",
                 flush=True,
             )
         self.image_shape = (h_req, w_req)

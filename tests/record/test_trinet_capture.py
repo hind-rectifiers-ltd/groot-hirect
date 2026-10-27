@@ -53,3 +53,10 @@ def test_crop_square_resize_rgb_720() -> None:
     bgr = np.full((1080, 1920, 3), 40, dtype=np.uint8)
     rgb = crop_square_resize_rgb(bgr, 720, 720)
     assert rgb.shape == (720, 720, 3)
+
+
+def test_crop_resize_rgb_1980x720_from_1920x1080() -> None:
+    bgr = np.full((1080, 1920, 3), 40, dtype=np.uint8)
+    rgb = crop_square_resize_rgb(bgr, 720, 1980)
+    assert rgb.shape == (720, 1980, 3)
+    assert rgb.dtype == np.uint8

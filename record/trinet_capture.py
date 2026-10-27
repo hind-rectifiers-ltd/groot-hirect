@@ -1,9 +1,10 @@
 """Trinet Mono UVC cameras as decoded OpenCV frames.
 
 Copied into this repo (do not import ``trinet_usb``). Each camera streams
-1920x1080 MJPEG at 30 fps with a ``TRINETIMUSEI`` motion block spliced into the
-JPEG, which makes OpenCV's decoder reject the frame. ``decode_trinet_raw``
-removes that block and returns BGR.
+1920x1080 MJPEG at 30 fps (the only V4L mode) with a ``TRINETIMUSEI`` motion
+block spliced into the JPEG, which makes OpenCV's decoder reject the frame.
+``decode_trinet_raw`` removes that block and returns BGR. Output defaults to
+1980x720 after an aspect-preserving center crop.
 
 Capture nodes are found by USB serial every start, so ``/dev/videoN`` changes
 across replugs do not matter.
@@ -24,8 +25,10 @@ TRINET_NATIVE_WIDTH = 1920
 TRINET_NATIVE_HEIGHT = 1080
 TRINET_NATIVE_FPS = 30.0
 
-# Record / policy default: square crop of the 1080p stream.
-PREFERRED_OUTPUT_SIZE = 1080
+# Record / policy default: 1980x720 from the 1920x1080 stream (center-crop + resize).
+PREFERRED_OUTPUT_WIDTH = 1980
+PREFERRED_OUTPUT_HEIGHT = 720
+PREFERRED_OUTPUT_SIZE = PREFERRED_OUTPUT_HEIGHT
 MIN_OUTPUT_SIZE = 720
 
 _IMU_MARK = b"TRINETIMUSEI"
@@ -90,16 +93,26 @@ def decode_trinet_raw(raw: np.ndarray) -> np.ndarray | None:
 
 
 def crop_square_resize_rgb(bgr: np.ndarray, height: int, width: int) -> np.ndarray:
-    """Center-crop the largest square, resize to ``(height, width)``, return RGB."""
-    h, w = bgr.shape[:2]
-    side = min(h, w)
-    y0 = (h - side) // 2
-    x0 = (w - side) // 2
-    square = bgr[y0 : y0 + side, x0 : x0 + side]
-    if square.shape[0] != height or square.shape[1] != width:
-        interp = cv2.INTER_AREA if side > max(height, width) else cv2.INTER_LINEAR
-        square = cv2.resize(square, (width, height), interpolation=interp)
-    return cv2.cvtColor(square, cv2.COLOR_BGR2RGB).astype(np.uint8)
+    """Center-crop to the target aspect, resize to ``(height, width)``, return RGB."""
+    src_h, src_w = bgr.shape[:2]
+    if src_h < 1 or src_w < 1 or height < 1 or width < 1:
+        raise ValueError(f"invalid crop/resize size src=({src_h},{src_w}) out=({height},{width})")
+    target_aspect = width / float(height)
+    src_aspect = src_w / float(src_h)
+    if src_aspect > target_aspect:
+        new_w = max(1, int(round(src_h * target_aspect)))
+        x0 = (src_w - new_w) // 2
+        crop = bgr[:, x0 : x0 + new_w]
+    elif src_aspect < target_aspect:
+        new_h = max(1, int(round(src_w / target_aspect)))
+        y0 = (src_h - new_h) // 2
+        crop = bgr[y0 : y0 + new_h, :]
+    else:
+        crop = bgr
+    if crop.shape[0] != height or crop.shape[1] != width:
+        interp = cv2.INTER_AREA if crop.shape[0] > height else cv2.INTER_LINEAR
+        crop = cv2.resize(crop, (width, height), interpolation=interp)
+    return cv2.cvtColor(crop, cv2.COLOR_BGR2RGB).astype(np.uint8)
 
 
 def _usb_identity(node: str) -> tuple[str, str, str] | None:
