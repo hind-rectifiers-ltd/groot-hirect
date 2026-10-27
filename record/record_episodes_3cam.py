@@ -139,13 +139,18 @@ class QposReadSanitizer:
 
 def test_cameras(max_index: int, image_shape: tuple[int, int], warmup: int = 12, black_threshold: float = 5.0) -> None:
     """Probe video indices and report which return non-black frames (legacy numeric scan)."""
-    from usb_cameras import open_capture, print_working_cameras
+    from trinet_capture import configure_trinet_capture, is_trinet_capture_node
+    from usb_cameras import open_capture, print_working_cameras, read_bgr_frame
 
     if max_index <= 0:
         print_working_cameras()
         return
 
-    h, w = image_shape
+    print(
+        f"Probing /dev/video0..{max_index - 1} "
+        f"(Trinet IMU JPEG is decoded; output size {image_shape[1]}x{image_shape[0]} is unused here).",
+        flush=True,
+    )
     working = []
     for i in range(max_index):
         path = f"/dev/video{i}"
@@ -153,14 +158,13 @@ def test_cameras(max_index: int, image_shape: tuple[int, int], warmup: int = 12,
         if not cap.isOpened():
             print(f"{path}: not opened")
             continue
-        import cv2
-
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+        trinet = is_trinet_capture_node(path)
+        if trinet:
+            configure_trinet_capture(cap)
         mean_val = 0.0
         for _ in range(warmup):
-            ret, frame = cap.read()
-            if ret and frame is not None and frame.size > 0:
+            frame = read_bgr_frame(cap, trinet=trinet)
+            if frame is not None:
                 mean_val = float(np.mean(frame))
                 if mean_val > black_threshold:
                     break
@@ -171,7 +175,7 @@ def test_cameras(max_index: int, image_shape: tuple[int, int], warmup: int = 12,
         else:
             print(f"{path}: black/no frames (mean {mean_val:.1f})")
     print(f"\nWorking indices: {working}")
-    print("Tip: use --list-cameras / --list-cameras-working for stable USB port IDs.")
+    print("Tip: use --list-cameras / --list-cameras-working for serial / USB port IDs.")
 
 
 class RobotInterface:
@@ -1192,8 +1196,8 @@ def main() -> None:
     p.add_argument("--dt", type=float, default=1.0 / 30.0)
     p.add_argument("--state-dim", type=int, default=16)
     p.add_argument("--action-dim", type=int, default=16)
-    p.add_argument("--image-height", type=int, default=640)
-    p.add_argument("--image-width", type=int, default=640)
+    p.add_argument("--image-height", type=int, default=1080)
+    p.add_argument("--image-width", type=int, default=1080)
     p.add_argument("--robot", choices=["demo", "usb_cam", "direct_teleop"], default="demo")
     p.add_argument("--leader-port", type=str, default="/dev/ttyACM0")
     p.add_argument("--leader-baud", type=int, default=57600)

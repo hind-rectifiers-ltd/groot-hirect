@@ -81,19 +81,21 @@ export CKPT="${FT_OUT}/checkpoint-10000"
 
 ### Camera setup (USB ports, not `/dev/videoN`)
 
-On Linux, **do not rely on numeric camera indices** (`/dev/video0`, `/dev/video8`, …) — they change across reboots. Instead, cameras are pinned by **physical USB port** in `record/camera_ports.json` and resolved automatically when `--use-usb-camera-ports` is set (default on Linux for record + policy client).
+On Linux, **do not rely on numeric camera indices** (`/dev/video0`, `/dev/video8`, …) — they change across reboots. Pin cameras in `record/camera_ports.json` by **USB serial** (preferred for Trinet Mono) or by **physical USB port** (`id_path_tag`). `--use-usb-camera-ports` is on by default on Linux for record + policy client.
 
-Verified mapping for this Jetson rig (from `--preview-all-cameras`):
+Trinet cameras stream **1920×1080 MJPEG at 30 fps**. Each JPEG has an in-band IMU block that OpenCV cannot decode; `record/trinet_capture.py` strips it on a **per-camera thread**, then center-crops to a square. Default output is **1080×1080 @ 30 fps** (minimum useful size **720×720**). Do not import `trinet_usb` — that kit stays standalone.
 
+Pin Trinet cameras by **serial** (from `--list-cameras-working`; 8-char prefix is enough):
 
-| Role        | HDF5 / LeRobot key | USB port (`id_path_tag`)           | Typical node |
-| ----------- | ------------------ | ---------------------------------- | ------------ |
-| Head        | `cam_head`         | `platform-3610000_usb-usb-0_4_3`   | `/dev/video8` |
-| Left wrist  | `cam_left_wrist`   | `platform-3610000_usb-usb-0_4_1`   | `/dev/video0` |
-| Right wrist | `cam_right_wrist`  | `platform-3610000_usb-usb-0_4_2`   | `/dev/video4` |
+```json
+{
+  "cam_head": {"serial": "<head-serial-prefix>"},
+  "cam_left_wrist": {"serial": "<left-wrist-serial-prefix>"},
+  "cam_right_wrist": {"serial": "<right-wrist-serial-prefix>"}
+}
+```
 
-
-The JSON on disk:
+Wave each camera in `preview_three_cameras.py` and put the printed `serial=` value on the matching role. Port-tag pinning still works:
 
 ```json
 {
@@ -405,8 +407,8 @@ uv run python record/policy_client_3cam.py \
   --robot robstride \
   --use-usb-camera-ports \
   --camera-fps 30 \
-  --image-height 640 \
-  --image-width 640 \
+  --image-height 1080 \
+  --image-width 1080 \
   --dry-run-robstride \
   --control-mode chunk \
   --rate-hz 30 \
@@ -429,8 +431,8 @@ uv run python record/policy_client_3cam.py \
   --robot robstride \
   --use-usb-camera-ports \
   --camera-fps 30 \
-  --image-height 640 \
-  --image-width 640 \
+  --image-height 1080 \
+  --image-width 1080 \
   --apply-actions \
   --control-mode chunk \
   --rate-hz 30 \
@@ -442,7 +444,7 @@ uv run python record/policy_client_3cam.py \
 
 `--use-usb-camera-ports` is on by default on Linux; it reads `record/camera_ports.json` so inference sees the same head / left / right views as training.
 
-**Must match recording/training:** `--rate-hz 30`, `--camera-fps 30`, 640×640 images, same camera ports, and the **exact** `--task` string from `meta/tasks.jsonl`.
+**Must match recording/training:** `--rate-hz 30`, `--camera-fps 30`, 1080×1080 images (or 720×720 if you recorded at 720), same camera ports, and the **exact** `--task` string from `meta/tasks.jsonl`. Old 640×640 checkpoints still need `--image-height 640 --image-width 640`.
 
 Safer first live pass (same rate match, slower arms):
 

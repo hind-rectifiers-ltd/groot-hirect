@@ -540,8 +540,8 @@ def main() -> None:
     p.add_argument("--robot", choices=["demo", "usb_cam", "robstride"], default="demo")
     _usb_cameras = _import_usb_cameras()
     _usb_cameras.add_three_camera_cli_args(p)
-    p.add_argument("--image-height", type=int, default=640)
-    p.add_argument("--image-width", type=int, default=640)
+    p.add_argument("--image-height", type=int, default=1080)
+    p.add_argument("--image-width", type=int, default=1080)
     p.add_argument("--apply-actions", action="store_true", help="Send decoded targets to RobStride (robstride only)")
     p.add_argument(
         "--dry-run-robstride",

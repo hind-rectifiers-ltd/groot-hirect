@@ -28,8 +28,8 @@ def main() -> None:
         description="Preview 3 cameras with role labels (verify camera_ports.json mapping)",
     )
     add_three_camera_cli_args(p)
-    p.add_argument("--image-height", type=int, default=480)
-    p.add_argument("--image-width", type=int, default=640)
+    p.add_argument("--image-height", type=int, default=1080)
+    p.add_argument("--image-width", type=int, default=1080)
     args = p.parse_args()
     if handle_camera_list_flags(args):
         return

@@ -1,14 +1,15 @@
 """
 Stable USB camera selection for the 3-cam GR00T rig (Linux V4L2).
 
-Pins each logical camera role (head / left wrist / right wrist) to a physical USB port
-via udev ``ID_PATH_TAG``, so the correct ``/dev/video*`` node is chosen even when numeric
-indices change across reboots.
+Pins each logical camera role (head / left wrist / right wrist) to a physical USB
+port (udev ``ID_PATH_TAG``) or camera serial in ``record/camera_ports.json``.
 
-Port mapping is stored in ``record/camera_ports.json`` (edit after
-``python record/record_episodes_3cam.py --list-cameras``).
-
-Derived from ``multi_img_client.py`` in the repo root.
+Trinet Mono cameras (VID:PID 2207:0016) stream 1920x1080 MJPEG at 30 fps with an
+in-band IMU JPEG block. Capture is handled in ``record/trinet_capture.py`` (copied
+from the camera kit; this package does not import ``trinet_usb``). Each camera
+runs on its own grabber thread, IMU data is stripped, then the frame is
+center-cropped to a square and resized to the requested output
+(default 1080x1080, minimum useful size 720x720).
 """
 
 from __future__ import annotations
@@ -27,9 +28,21 @@ from typing import Any
 
 import numpy as np
 
+from trinet_capture import (
+    MIN_OUTPUT_SIZE,
+    PREFERRED_OUTPUT_SIZE,
+    TRINET_NATIVE_FPS,
+    configure_trinet_capture,
+    crop_square_resize_rgb,
+    decode_trinet_raw,
+    is_trinet_capture_node,
+    list_trinet_cameras,
+)
+
 # Default: if no new frame arrives within this window, treat the camera as dead.
 # At 15–30 FPS a healthy cam updates every ~33–67 ms; 1.5 s is a clear stall.
 DEFAULT_CAMERA_STALE_TIMEOUT_S = 1.5
+DEFAULT_IMAGE_SIZE = PREFERRED_OUTPUT_SIZE
 
 
 class CameraStoppedError(RuntimeError):
@@ -235,7 +248,9 @@ def identity_matches_select(ident: dict[str, str], spec: dict[str, str] | str) -
             if _norm_hex(w) != _norm_hex(ident.get(key, "")):
                 return False
         elif key == "serial":
-            if ident.get("serial", "") != w:
+            got = ident.get("serial", "")
+            # Full serial or the stable 8-char prefix printed in --list-cameras.
+            if got != w and not got.startswith(w) and not w.startswith(got):
                 return False
         elif key == "usb_port_id":
             if ident.get("usb_port_id", "") != w:
@@ -284,18 +299,31 @@ def open_capture(dev: int | str):
     return cv2.VideoCapture(dev)
 
 
-def read_valid_frame(cap) -> bool:
-    ret, img = cap.read()
-    if not ret or img is None or getattr(img, "size", 0) == 0:
-        return False
-    h, w = img.shape[:2]
-    return w > 2 and h > 2
+def read_bgr_frame(cap, *, trinet: bool) -> np.ndarray | None:
+    """One decoded BGR frame, or None. Trinet grabs must strip the IMU JPEG block."""
+    ret, raw = cap.read()
+    if not ret or raw is None or getattr(raw, "size", 0) == 0:
+        return None
+    if trinet:
+        return decode_trinet_raw(raw)
+    if raw.ndim < 2:
+        return None
+    h, w = raw.shape[:2]
+    if w <= 2 or h <= 2:
+        return None
+    return raw
+
+
+def read_valid_frame(cap, *, trinet: bool = False) -> bool:
+    frame = read_bgr_frame(cap, trinet=trinet)
+    return frame is not None
 
 
 def probe_cameras_detailed(*, warmup_reads: int = WARMUP_READS) -> list[dict[str, Any]]:
     """One entry per physical camera that delivers frames."""
     found: list[dict[str, Any]] = []
     seen_physical: set[str | tuple[str, int]] = set()
+    trinet_nodes = {cam.node for cam in list_trinet_cameras()}
 
     if sys.platform.startswith("linux"):
         candidates: list[str | int] = list_v4l2_device_nodes()
@@ -306,14 +334,27 @@ def probe_cameras_detailed(*, warmup_reads: int = WARMUP_READS) -> list[dict[str
         if isinstance(dev_path, str) and dev_path.startswith("/dev/") and not os.path.exists(dev_path):
             continue
 
+        path = device_to_path(dev_path) if not isinstance(dev_path, str) else dev_path
+        try:
+            real = os.path.realpath(path)
+        except OSError:
+            real = path
+        trinet = real in trinet_nodes
+        ident = get_camera_identity(path) if isinstance(path, str) else {}
+        # Skip Trinet metadata nodes (same USB device, not a capture interface).
+        if ident.get("vendor") == "2207" and ident.get("product") == "0016" and not trinet:
+            continue
+
         cap = open_capture(dev_path)
         if not cap.isOpened():
             cap.release()
             continue
+        if trinet:
+            configure_trinet_capture(cap, fps=TRINET_NATIVE_FPS)
 
         ok = False
         for _ in range(max(1, warmup_reads)):
-            if read_valid_frame(cap):
+            if read_valid_frame(cap, trinet=trinet):
                 ok = True
                 break
         if not ok:
@@ -330,8 +371,7 @@ def probe_cameras_detailed(*, warmup_reads: int = WARMUP_READS) -> list[dict[str
             continue
         seen_physical.add(key)
 
-        ident = get_camera_identity(dev_path) if isinstance(dev_path, str) else {}
-        found.append({"path": dev_path, "identity": ident})
+        found.append({"path": path, "identity": ident})
         cap.release()
 
     return found
@@ -384,19 +424,31 @@ def print_list_cameras_help() -> None:
     for line in lines:
         print(line)
     print(
-        "\nEdit record/camera_ports.json with id_path_tag per role "
+        "\nEdit record/camera_ports.json with id_path_tag or serial per role "
         "(cam_head, cam_left_wrist, cam_right_wrist).\n"
+        "Trinet cameras pin most reliably by serial, e.g. "
+        '{"cam_head": {"serial": "5fcbc688"}}.\n'
         "Run with --list-cameras-working to probe which nodes actually capture frames."
     )
 
 
 def print_working_cameras() -> None:
+    trinet = list_trinet_cameras()
+    if trinet:
+        print("Trinet capture nodes (by serial):")
+        for cam in trinet:
+            print(f"  {cam.serial}  {cam.node}  {cam.by_id}")
+        print()
     detailed = probe_cameras_detailed()
     if not detailed:
         print("No working V4L2 capture devices found.")
         return
+    print("Working capture devices:")
     for entry in detailed:
-        print(f"{entry['path']} -> {format_camera_identity_line(entry.get('identity') or {})}")
+        ident = entry.get("identity") or {}
+        serial = ident.get("serial") or ""
+        serial_bit = f"  serial={serial}" if serial else ""
+        print(f"{entry['path']}{serial_bit} -> {format_camera_identity_line(ident)}")
 
 
 def configure_capture(
@@ -487,12 +539,17 @@ def resolve_role_camera_devices(
     for role, entry in zip(need_usb, matched, strict=True):
         out[role] = entry["path"]
 
-    print("[usb_cameras] Resolved by USB port:", flush=True)
+    print("[usb_cameras] Resolved cameras:", flush=True)
     for role in roles:
         dev = out[role]
         ident = get_camera_identity(dev) if isinstance(dev, str) else {}
         tag = ident.get("id_path_tag", "")
-        print(f"  {role}: {device_to_path(dev)}  instance={tag or '?'}", flush=True)
+        serial = ident.get("serial", "")
+        serial_bit = f"  serial={serial}" if serial else ""
+        print(
+            f"  {role}: {device_to_path(dev)}{serial_bit}  instance={tag or '?'}",
+            flush=True,
+        )
 
     return out
 
@@ -554,9 +611,10 @@ def add_three_camera_cli_args(parser: argparse.ArgumentParser) -> None:
         default=30.0,
         help=(
             "UVC capture FPS (default 30, matches Record_Flow 30 Hz). "
-            "On a shared USB 2.0 hub three cams often cannot sustain 30; "
-            "the rig auto-falls back to 15, or pass --camera-fps 15. "
-            "For true 30 FPS, put cams on USB 3 (lsusb -t → Bus 02)."
+            "Trinet cameras natively stream 1920x1080 MJPEG at 30 fps; output is "
+            "center-cropped to a square (default 1080x1080). "
+            "On a saturated USB 2.0 hub the rig auto-falls back to 15 fps. "
+            "Prefer USB 3 for three cameras at 30 fps."
         ),
     )
 
@@ -626,7 +684,7 @@ def _annotate_preview_frame(
 def run_camera_mapping_preview(
     device_map: dict[str, int | str],
     *,
-    image_shape: tuple[int, int] = (480, 640),
+    image_shape: tuple[int, int] = (DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE),
     window_name: str = "GR00T: verify camera_ports.json (Esc=quit)",
     fps: float = 30.0,
 ) -> None:
@@ -669,6 +727,11 @@ def run_camera_mapping_preview(
             for role in THREE_CAM_ROLES:
                 rgb = rig.read_rgb(role)
                 bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                # Keep the GUI panel small even when capturing 1080x1080.
+                disp_h = min(bgr.shape[0], 480)
+                if bgr.shape[0] != disp_h:
+                    disp_w = max(1, int(round(bgr.shape[1] * disp_h / bgr.shape[0])))
+                    bgr = cv2.resize(bgr, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
                 path, tag = role_meta[role]
                 cam_fps = rig.measured_fps(role)
                 subtitle = f"{path}  instance={tag}"
@@ -710,7 +773,9 @@ def run_camera_mapping_preview(
         cv2.destroyAllWindows()
 
 
-def run_preview_all_working_cameras(*, image_shape: tuple[int, int] = (480, 640)) -> None:
+def run_preview_all_working_cameras(
+    *, image_shape: tuple[int, int] = (DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_SIZE)
+) -> None:
     """Show each working camera one at a time with USB instance id (build camera_ports.json)."""
     import cv2
 
@@ -728,25 +793,32 @@ def run_preview_all_working_cameras(*, image_shape: tuple[int, int] = (480, 640)
             path = entry["path"]
             ident = entry.get("identity") or {}
             tag = ident.get("id_path_tag", "?")
+            serial = ident.get("serial", "")
             title = f"Camera {idx % len(detailed) + 1}/{len(detailed)}"
-            subtitle = f"{path}  instance={tag}"
+            subtitle = f"{path}  serial={serial or '?'}  instance={tag}"
+            trinet = is_trinet_capture_node(path)
 
             cap = open_capture(path)
             if not cap.isOpened():
                 print(f"Skip {path} (not opened)")
                 idx += 1
                 continue
-            configure_capture(cap, w, h, prefer_mjpeg=True, fps=30.0)
+            if trinet:
+                configure_trinet_capture(cap, fps=TRINET_NATIVE_FPS)
+            else:
+                configure_capture(cap, w, h, prefer_mjpeg=True, fps=30.0)
             try:
                 while True:
-                    ret, frame = cap.read()
-                    if not ret or frame is None:
+                    frame = read_bgr_frame(cap, trinet=trinet)
+                    if frame is None:
                         blank = np.zeros((h, w, 3), dtype=np.uint8)
                     else:
-                        if frame.shape[:2] != (h, w):
-                            blank = cv2.resize(frame, (w, h))
-                        else:
-                            blank = frame
+                        rgb = crop_square_resize_rgb(frame, h, w)
+                        blank = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                    disp_h = min(blank.shape[0], 480)
+                    if blank.shape[0] != disp_h:
+                        disp_w = max(1, int(round(blank.shape[1] * disp_h / blank.shape[0])))
+                        blank = cv2.resize(blank, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
                     view = _annotate_preview_frame(
                         blank,
                         title=title,
@@ -768,8 +840,8 @@ def run_preview_all_working_cameras(*, image_shape: tuple[int, int] = (480, 640)
 
 def run_camera_preview_from_args(args: argparse.Namespace) -> None:
     """Entry for --preview-cameras / --preview-all-cameras."""
-    h = int(getattr(args, "image_height", 480))
-    w = int(getattr(args, "image_width", 640))
+    h = int(getattr(args, "image_height", DEFAULT_IMAGE_SIZE))
+    w = int(getattr(args, "image_width", DEFAULT_IMAGE_SIZE))
     shape = (h, w)
     if getattr(args, "preview_all_cameras", False):
         run_preview_all_working_cameras(image_shape=shape)
@@ -807,12 +879,26 @@ def handle_camera_list_flags(args: argparse.Namespace) -> bool:
 
 
 class _CameraGrabber(threading.Thread):
-    """Continuously pull frames from one VideoCapture so read_rgb() is non-blocking."""
+    """Continuously pull frames from one VideoCapture so read_rgb() is non-blocking.
 
-    def __init__(self, cap: Any, name: str):
+    Each camera has its own thread. Trinet grabs keep CONVERT_RGB=0, strip the IMU
+    JPEG block, decode, then center-crop to the output square. The latest RGB frame
+    is stored so the record/policy loop never blocks on USB or JPEG decode.
+    """
+
+    def __init__(
+        self,
+        cap: Any,
+        name: str,
+        *,
+        image_shape: tuple[int, int],
+        trinet: bool,
+    ):
         super().__init__(name=f"cam-grab-{name}", daemon=True)
         self._cap = cap
         self._name = name
+        self._out_h, self._out_w = int(image_shape[0]), int(image_shape[1])
+        self._trinet = bool(trinet)
         self._lock = threading.Lock()
         self._frame: np.ndarray | None = None
         self._stop_event = threading.Event()
@@ -824,31 +910,44 @@ class _CameraGrabber(threading.Thread):
         self._frame_seq = 0
         self._last_ok_mono = 0.0
 
+    def _decode_latest(self) -> np.ndarray | None:
+        if self._trinet:
+            ok, raw = self._cap.read()
+            if not ok or raw is None:
+                return None
+            bgr = decode_trinet_raw(raw)
+            if bgr is None:
+                return None
+            return crop_square_resize_rgb(bgr, self._out_h, self._out_w)
+
+        # grab()+retrieve() avoids OpenCV read() dropping every other frame on
+        # some UVC MJPEG devices when the decode path is slower than the stream.
+        if not self._cap.grab():
+            return None
+        ret, frame = self._cap.retrieve()
+        if not ret or frame is None or getattr(frame, "size", 0) == 0:
+            return None
+        return crop_square_resize_rgb(frame, self._out_h, self._out_w)
+
     def run(self) -> None:
         while not self._stop_event.is_set():
-            # grab()+retrieve() avoids OpenCV read() dropping every other frame on
-            # some UVC MJPEG devices when the decode path is slower than the stream.
-            if not self._cap.grab():
+            frame = self._decode_latest()
+            if frame is None:
                 self._fail += 1
                 time.sleep(0.002)
                 continue
-            ret, frame = self._cap.retrieve()
-            if ret and frame is not None and getattr(frame, "size", 0) > 0:
-                with self._lock:
-                    self._frame = frame
-                    self._frame_seq += 1
-                    self._last_ok_mono = time.monotonic()
-                self._ok += 1
-                self._fps_window_ok += 1
-                now = time.time()
-                elapsed = now - self._fps_window_start
-                if elapsed >= 0.5:
-                    self._measured_fps = self._fps_window_ok / elapsed
-                    self._fps_window_ok = 0
-                    self._fps_window_start = now
-            else:
-                self._fail += 1
-                time.sleep(0.002)
+            with self._lock:
+                self._frame = frame
+                self._frame_seq += 1
+                self._last_ok_mono = time.monotonic()
+            self._ok += 1
+            self._fps_window_ok += 1
+            now = time.time()
+            elapsed = now - self._fps_window_start
+            if elapsed >= 0.5:
+                self._measured_fps = self._fps_window_ok / elapsed
+                self._fps_window_ok = 0
+                self._fps_window_start = now
 
     def latest(self) -> np.ndarray | None:
         with self._lock:
@@ -899,7 +998,21 @@ class USBCameraRig:
             raise ImportError("opencv-python is required for USB cameras") from exc
 
         self._cv2 = cv2
-        self.image_shape = image_shape
+        h_req, w_req = int(image_shape[0]), int(image_shape[1])
+        if h_req != w_req:
+            print(
+                f"[usb_cameras] WARNING: image_shape={image_shape} is not square; "
+                "Trinet frames are center-cropped to a square then resized.",
+                flush=True,
+            )
+        if min(h_req, w_req) < MIN_OUTPUT_SIZE:
+            print(
+                f"[usb_cameras] WARNING: output {h_req}x{w_req} is below the "
+                f"{MIN_OUTPUT_SIZE}x{MIN_OUTPUT_SIZE} minimum for this rig; "
+                f"prefer {PREFERRED_OUTPUT_SIZE}x{PREFERRED_OUTPUT_SIZE} @ 30 fps.",
+                flush=True,
+            )
+        self.image_shape = (h_req, w_req)
         self._device_map = dict(device_map)
         self._caps: dict[str, Any] = {}
         self._grabbers: dict[str, _CameraGrabber] = {}
@@ -917,6 +1030,7 @@ class USBCameraRig:
             fps = 30.0 if multi else None
         self.fps = fps
 
+        self._trinet: dict[str, bool] = {}
         self._open_all(fps=fps)
         if threaded:
             missing = self._start_grabbers_and_warmup()
@@ -949,38 +1063,55 @@ class USBCameraRig:
 
     def _open_all(self, *, fps: float | None) -> None:
         h, w = self.image_shape
-        multi = len(self._device_map) > 1
+        trinet_nodes = {cam.node for cam in list_trinet_cameras()}
         for cam_name, dev in self._device_map.items():
             path = device_to_path(dev) if isinstance(dev, int) else str(dev)
+            try:
+                real = os.path.realpath(path)
+            except OSError:
+                real = path
+            trinet = real in trinet_nodes
+            self._trinet[cam_name] = trinet
             cap = open_capture(dev)
             if not cap.isOpened():
                 cap.release()
                 cap = open_capture(path)
             if not cap.isOpened():
                 raise RuntimeError(f"Failed to open camera {cam_name} at {path}")
-            # Head (Arducam Low Light) needs a deeper V4L buffer under multi-cam
-            # load or MJPEG decode drops frames (~half FPS). Wrist cams keep
-            # buffer=1 so a requested 15 FPS cap still sticks on this USB 2 hub.
-            buf = 3 if cam_name == "cam_head" else 1
-            configure_capture(
-                cap,
-                w,
-                h,
-                prefer_mjpeg=self._prefer_mjpeg,
-                fps=fps,
-                buffer_size=buf,
-            )
+            if trinet:
+                configure_trinet_capture(cap, fps=fps if fps is not None else TRINET_NATIVE_FPS)
+            else:
+                # Head (legacy Arducam) needs a deeper V4L buffer under multi-cam
+                # load or MJPEG decode drops frames (~half FPS).
+                buf = 3 if cam_name == "cam_head" else 1
+                configure_capture(
+                    cap,
+                    w,
+                    h,
+                    prefer_mjpeg=self._prefer_mjpeg,
+                    fps=fps,
+                    buffer_size=buf,
+                )
             self._caps[cam_name] = cap
             time.sleep(0.2)
+        kinds = ",".join(
+            f"{name}={'trinet' if self._trinet.get(name) else 'uvc'}" for name in self._caps
+        )
         print(
             f"[usb_cameras] Opened {len(self._caps)} cameras "
-            f"(mjpeg={self._prefer_mjpeg}, fps={fps}, threaded={self._threaded})",
+            f"({kinds}; mjpeg={self._prefer_mjpeg}, fps={fps}, "
+            f"output={h}x{w}, threaded={self._threaded})",
             flush=True,
         )
 
     def _start_grabbers_and_warmup(self) -> list[str]:
         for cam_name, cap in self._caps.items():
-            grabber = _CameraGrabber(cap, cam_name)
+            grabber = _CameraGrabber(
+                cap,
+                cam_name,
+                image_shape=self.image_shape,
+                trinet=self._trinet.get(cam_name, False),
+            )
             grabber.start()
             self._grabbers[cam_name] = grabber
         deadline = time.time() + 3.0
@@ -1011,9 +1142,9 @@ class USBCameraRig:
             frame = grabber.latest()
         else:
             cap = self._caps[cam_name]
-            ret, got = cap.read()
-            if ret and got is not None:
-                frame = got
+            bgr = read_bgr_frame(cap, trinet=self._trinet.get(cam_name, False))
+            if bgr is not None:
+                frame = crop_square_resize_rgb(bgr, h, w)
         if frame is None:
             raise CameraStoppedError(
                 f"camera stopped working: {cam_name} returned no frame "
@@ -1021,6 +1152,8 @@ class USBCameraRig:
             )
         if frame.shape[:2] != (h, w):
             frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_LINEAR)
+        if frame.ndim == 3 and frame.shape[2] == 3:
+            return frame.astype(np.uint8)
         return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.uint8)
 
     def assert_cameras_alive(

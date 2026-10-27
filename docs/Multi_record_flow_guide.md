@@ -298,7 +298,7 @@ uv run python record/policy_client_3cam.py \
   --host localhost --port 5555 \
   --task "pick up the object and place it in the tray" \
   --robot robstride --use-usb-camera-ports \
-  --camera-fps 30 --image-height 640 --image-width 640 \
+  --camera-fps 30 --image-height 1080 --image-width 1080 \
   --dry-run-robstride --control-mode chunk --rate-hz 30 --max-steps 10
 
 # Task 2 (only --task changes)
@@ -306,7 +306,7 @@ uv run python record/policy_client_3cam.py \
   --host localhost --port 5555 \
   --task "pick up the object and place it in the bowl" \
   --robot robstride --use-usb-camera-ports \
-  --camera-fps 30 --image-height 640 --image-width 640 \
+  --camera-fps 30 --image-height 1080 --image-width 1080 \
   --dry-run-robstride --control-mode chunk --rate-hz 30 --max-steps 10
 ```
 
